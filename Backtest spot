@@ -1,0 +1,308 @@
+"""
+Backtest semplice del bot spot multi-coin (stessa logica del bot):
+- ogni ciclo: prima SELL (lotto col rendimento maggiore che ha raggiunto il target,
+  vende SELL_PERCENT%), altrimenti BUY (coin col ribasso 24h piu' forte >= DIP)
+- ribasso = (max 24h - prezzo) / max 24h, su candele da 1h (come il bot)
+- limiti: MAX_POSITION per coin, MAX_WEEKLY_BUYS globale, minimo d'ordine
+
+Esempi:
+  python backtest_spot.py
+  python backtest_spot.py --dip 2,3,4 --tp 4,6 --interval 1,4
+  python backtest_spot.py --synthetic        (dati casuali, solo per provare lo script)
+
+Approssimazioni: niente tick/szDecimals, fee uguale su entrambi i lati,
+prezzo del ciclo = chiusura della candela 1h. I dati arrivano dall'API
+Hyperliquid (max ~5000 candele 1h, circa 208 giorni) e vengono salvati in cache.
+"""
+
+import argparse
+import itertools
+import json
+import os
+import random
+from datetime import datetime, timezone
+
+HOUR_MS = 3600 * 1000
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--coins", default="HYPE,ZEC,ETH,SOL")
+    p.add_argument("--days", type=int, default=200)
+    p.add_argument("--capital", type=float, default=1000)
+    # liste separate da virgola = griglia di combinazioni
+    p.add_argument("--buy-usd", default="12")
+    p.add_argument("--dip", default="2")
+    p.add_argument("--tp", default="4")
+    p.add_argument("--interval", default="4", help="ore tra un ciclo e l'altro")
+    p.add_argument("--sell-percent", type=float, default=95)
+    p.add_argument("--max-position", type=float, default=200)
+    p.add_argument("--weekly-buys", type=int, default=10)
+    p.add_argument("--fee", type=float, default=0.0007, help="per lato (0.0007 = 0.07%%)")
+    p.add_argument("--slippage", type=float, default=0.0005)
+    p.add_argument("--min-order", type=float, default=10)
+    p.add_argument("--synthetic", action="store_true")
+    p.add_argument("--cache", default="candles_cache.json")
+    return p.parse_args()
+
+
+# ============================================================
+# DATI
+# ============================================================
+
+def fetch_candles(coins, days, cache):
+    if cache and os.path.exists(cache):
+        with open(cache) as f:
+            data = json.load(f)
+        if set(coins) <= set(data):
+            return {c: data[c] for c in coins}
+
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
+    info = Info(constants.MAINNET_API_URL, skip_ws=True)
+    meta = info.spot_meta()
+
+    usdc = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
+
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = end_ms - days * 24 * HOUR_MS
+
+    data = {}
+
+    for coin in coins:
+        market = None
+
+        for idx, token in enumerate(meta["tokens"]):
+            if token["name"] in (coin, "U" + coin):
+                market = next((m["name"] for m in meta["universe"] if m["tokens"] == [idx, usdc]), None)
+
+                if market:
+                    break
+
+        if not market:
+            print(f"ATTENZIONE: nessun mercato spot {coin}/USDC: coin ignorata")
+            continue
+
+        candles = info.candles_snapshot(market, "1h", start_ms, end_ms)
+        data[coin] = [{"t": c["t"], "h": float(c["h"]), "c": float(c["c"])} for c in candles]
+
+    if cache:
+        with open(cache, "w") as f:
+            json.dump(data, f)
+
+    return data
+
+
+def synthetic_candles(coins, days, seed=1):
+    rnd = random.Random(seed)
+    t0 = int(datetime.now(timezone.utc).timestamp() * 1000) // HOUR_MS * HOUR_MS - days * 24 * HOUR_MS
+
+    data = {}
+
+    for coin in coins:
+        price = rnd.uniform(20, 300)
+        series = []
+
+        for i in range(days * 24):
+            new = price * (1 + rnd.gauss(0, 0.008))
+            high = max(price, new) * (1 + abs(rnd.gauss(0, 0.002)))
+            series.append({"t": t0 + i * HOUR_MS, "h": high, "c": new})
+            price = new
+
+        data[coin] = series
+
+    return data
+
+
+def align(data):
+    common = sorted(set.intersection(*[{c["t"] for c in v} for v in data.values()]))
+
+    closes = {}
+    highs = {}
+
+    for coin, v in data.items():
+        by_t = {c["t"]: c for c in v}
+        closes[coin] = [by_t[t]["c"] for t in common]
+        highs[coin] = [by_t[t]["h"] for t in common]
+
+    return common, closes, highs
+
+
+# ============================================================
+# SIMULAZIONE
+# ============================================================
+
+def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
+    coins = list(closes)
+
+    usdc = a.capital
+    lots = []
+    weekly = {}
+
+    realized = 0.0
+    buys = 0
+    sells = 0
+    peak = a.capital
+    max_dd = 0.0
+    max_deployed = 0.0
+    per = {c: {"buys": 0, "sells": 0, "realized": 0.0} for c in coins}
+
+    for i in range(23, len(times), interval):
+        px = {c: closes[c][i] for c in coins}
+
+        equity = usdc + sum(l["qty"] * px[l["coin"]] for l in lots)
+        peak = max(peak, equity)
+        max_dd = max(max_dd, (peak - equity) / peak * 100)
+        max_deployed = max(max_deployed, sum(l["qty"] * l["cost"] for l in lots))
+
+        # ---- SELL: lotto col rendimento maggiore tra quelli a target ----
+        best = None
+
+        for lot in lots:
+            p = px[lot["coin"]]
+
+            if p >= lot["target"] and lot["qty"] * a.sell_percent / 100 * p >= a.min_order:
+                ret = p / lot["buy_price"]
+
+                if best is None or ret > best[0]:
+                    best = (ret, lot)
+
+        if best:
+            lot = best[1]
+            qty = lot["qty"] * a.sell_percent / 100
+            proceeds = qty * px[lot["coin"]] * (1 - a.slippage) * (1 - a.fee)
+
+            usdc += proceeds
+            pnl = proceeds - qty * lot["cost"]
+            realized += pnl
+            per[lot["coin"]]["realized"] += pnl
+            per[lot["coin"]]["sells"] += 1
+            lot["qty"] -= qty
+            sells += 1
+            continue
+
+        # ---- BUY: coin col ribasso 24h piu' forte (poi le successive se bloccata) ----
+        week = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%G-W%V")
+
+        drops = []
+
+        for c in coins:
+            high_24h = max(highs[c][i - 23:i + 1])
+            drops.append(((high_24h - px[c]) / high_24h * 100, c))
+
+        drops.sort(reverse=True)
+
+        for drop, c in drops:
+            if drop < dip:
+                break
+
+            held = sum(l["qty"] for l in lots if l["coin"] == c) * px[c]
+
+            if held + buy_usd > a.max_position or weekly.get(week, 0) >= a.weekly_buys or usdc < buy_usd:
+                continue
+
+            fill = px[c] * (1 + a.slippage)
+            qty = buy_usd / fill * (1 - a.fee)
+
+            usdc -= buy_usd
+            lots.append({"coin": c, "qty": qty, "buy_price": fill, "target": fill * (1 + tp / 100), "cost": buy_usd / qty})
+            weekly[week] = weekly.get(week, 0) + 1
+            per[c]["buys"] += 1
+            buys += 1
+            break
+
+    last = {c: closes[c][-1] for c in coins}
+    open_value = sum(l["qty"] * last[l["coin"]] for l in lots)
+    final = usdc + open_value
+
+    for c in coins:
+        c_lots = [l for l in lots if l["coin"] == c]
+        per[c]["unrealized"] = sum(l["qty"] * (last[c] - l["cost"]) for l in c_lots)
+        per[c]["open"] = sum(1 for l in c_lots if l["qty"] * last[c] >= a.min_order)
+
+    return {
+        "buy": buy_usd, "dip": dip, "tp": tp, "int": interval,
+        "ret": (final - a.capital) / a.capital * 100,
+        "final": final,
+        "realized": realized,
+        "unrealized": open_value - sum(l["qty"] * l["cost"] for l in lots),
+        "buys": buys, "sells": sells,
+        "open": sum(1 for l in lots if l["qty"] * last[l["coin"]] >= a.min_order),
+        "dd": max_dd,
+        "deployed": max_deployed,
+        "per": per,
+    }
+
+
+def print_report(r, a, closes, days):
+    print("=" * 60)
+    print(f"PERFORMANCE DEL BOT NEGLI ULTIMI {days:.0f} GIORNI")
+    print("=" * 60)
+    print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
+    print(f"Capitale iniziale        ${a.capital:>10.2f}")
+    print(f"Valore finale            ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
+    print(f"  profitto realizzato    ${r['realized']:>10.2f}")
+    print(f"  non realizzato         ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
+    print(f"Acquisti / vendite       {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
+    print(f"Max capitale investito   ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
+    print(f"Max drawdown             {r['dd']:>10.2f}%")
+    print()
+    print(f"{'coin':<6} {'buy':>5} {'sell':>5} {'realiz.':>9} {'non real.':>10} {'aperti':>7} {'coin nel periodo':>17}")
+
+    for c, v in r["per"].items():
+        move = (closes[c][-1] / closes[c][23] - 1) * 100
+        print(f"{c:<6} {v['buys']:>5} {v['sells']:>5} {v['realized']:>9.2f} {v['unrealized']:>10.2f} {v['open']:>7} {move:>+16.1f}%")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    a = parse_args()
+    coins = [c.strip().upper() for c in a.coins.split(",") if c.strip()]
+
+    data = synthetic_candles(coins, a.days) if a.synthetic else fetch_candles(coins, a.days, a.cache)
+
+    times, closes, highs = align(data)
+
+    if len(times) < 48:
+        raise SystemExit("Dati insufficienti")
+
+    days = (times[-1] - times[0]) / HOUR_MS / 24
+    start = datetime.fromtimestamp(times[0] / 1000, timezone.utc).strftime("%Y-%m-%d")
+    end = datetime.fromtimestamp(times[-1] / 1000, timezone.utc).strftime("%Y-%m-%d")
+
+    bh = sum(closes[c][-1] / closes[c][23] - 1 for c in closes) / len(closes) * 100
+
+    print(f"Periodo {start} -> {end} ({days:.0f} giorni, {len(times)} candele 1h) | coin {','.join(closes)}")
+    print(f"Buy&hold equipesato (riferimento, non stessa esposizione): {bh:+.1f}%")
+    print(f"Capitale {a.capital:.0f} | fee {a.fee * 100:.3f}% e slippage {a.slippage * 100:.3f}% per lato | sell {a.sell_percent:.0f}%\n")
+
+    grid = itertools.product(
+        [float(x) for x in a.buy_usd.split(",")],
+        [float(x) for x in a.dip.split(",")],
+        [float(x) for x in a.tp.split(",")],
+        [int(x) for x in a.interval.split(",")],
+    )
+
+    results = [simulate(times, closes, highs, b, d, t, i, a) for b, d, t, i in grid]
+    results.sort(key=lambda r: r["ret"], reverse=True)
+
+    if len(results) == 1:
+        print_report(results[0], a, closes, days)
+        return
+
+    print(f"{'buy':>5} {'dip%':>5} {'tp%':>5} {'ore':>4} | {'ritorno%':>9} {'finale':>9} {'realiz.':>8} {'non real.':>9} {'buy':>5} {'sell':>5} {'aperti':>6} {'maxDD%':>7} {'max inv.':>9}")
+
+    for r in results:
+        print(
+            f"{r['buy']:>5.0f} {r['dip']:>5.1f} {r['tp']:>5.1f} {r['int']:>4} | "
+            f"{r['ret']:>+9.2f} {r['final']:>9.2f} {r['realized']:>8.2f} {r['unrealized']:>9.2f} "
+            f"{r['buys']:>5} {r['sells']:>5} {r['open']:>6} {r['dd']:>7.2f} {r['deployed']:>9.2f}"
+        )
+
+
+if __name__ == "__main__":
+    main()
