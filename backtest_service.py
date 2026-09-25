@@ -136,14 +136,22 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
             sells += 1
             continue
 
-        # ---- BUY: coin col ribasso 24h piu' forte (poi le successive se bloccata) ----
+        # ---- BUY: coin col ribasso piu' forte (poi le successive se bloccata) ----
+        # riferimento: max 24h per il primo lotto della coin, poi il lotto col prezzo
+        # di acquisto piu' basso tra quelli aperti (stessa logica del bot)
         week = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%G-W%V")
 
         drops = []
 
         for c in coins:
-            high_24h = max(highs[c][i - 23:i + 1])
-            drops.append(((high_24h - px[c]) / high_24h * 100, c))
+            open_lots = [l for l in lots if l["coin"] == c]
+
+            if open_lots:
+                reference = min(l["buy_price"] for l in open_lots)
+            else:
+                reference = max(highs[c][i - 23:i + 1])
+
+            drops.append(((reference - px[c]) / reference * 100, c))
 
         drops.sort(reverse=True)
 
