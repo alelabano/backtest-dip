@@ -25,7 +25,7 @@ HOUR_MS = 3600 * 1000
 # DATI E SIMULAZIONE
 # ============================================================
 
-def fetch_candles(coins, days, cache):
+def fetch_candles(coins, days, cache=None):
     if cache and os.path.exists(cache):
         with open(cache) as f:
             data = json.load(f)
@@ -202,11 +202,11 @@ def print_report(r, a, closes, days):
     print(f"PERFORMANCE DEL BOT NEGLI ULTIMI {days:.0f} GIORNI")
     print("=" * 60)
     print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
-    print(f"Capitale iniziale        ${a.capital:>10.2f}")
-    print(f"Valore finale            ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
-    print(f"  profitto realizzato    ${r['realized']:>10.2f}")
-    print(f"  non realizzato         ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
-    print(f"Acquisti / vendite       {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
+    print(f"Capitale iniziale         ${a.capital:>10.2f}")
+    print(f"Valore finale             ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
+    print(f"  profitto realizzato     ${r['realized']:>10.2f}")
+    print(f"  non realizzato          ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
+    print(f"Acquisti / vendite        {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
     print(f"Max capitale investito   ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
     print(f"Max drawdown             {r['dd']:>10.2f}%")
     print()
@@ -215,7 +215,7 @@ def print_report(r, a, closes, days):
     for c, v in r["per"].items():
         move = (closes[c][-1] / closes[c][23] - 1) * 100
         print(f"{c:<6} {v['buys']:>5} {v['sells']:>5} {v['realized']:>9.2f} {v['unrealized']:>10.2f} {v['open']:>7} {move:>+16.1f}%")
-
+    print("=" * 60, flush=True)
 
 
 # ============================================================
@@ -237,10 +237,8 @@ TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4"))
 # Solo backtest (l'API restituisce al massimo ~5000 candele 1h, circa 208 giorni)
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Se impostato, il capitale iniziale del backtest e' quello reale del conto
-# (USDC + valore delle coin gestite), letto solo in lettura: non serve la
-# chiave privata, basta l'indirizzo pubblico.
-ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
+# Indirizzo pubblico letto dalle variabili di Railway
+ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or os.getenv("HL_ACCOUNT_ADDRESS")
 
 args = SimpleNamespace(
     capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
@@ -259,9 +257,10 @@ def log(message):
 
 
 def get_real_capital(coins, last_prices):
-    # Capitale reale sul conto: USDC + valore delle coin gestite dal bot,
-    # al prezzo di chiusura piu' recente (stesso dato del backtest, nessuna
-    # chiamata extra all'orderbook). Coin non gestite dal bot non sono incluse.
+    """
+    Recupera il valore totale del conto su Hyperliquid (USDC + token gestiti) 
+    in sola lettura tramite HYPERLIQUID_ACCOUNT_ADDRESS.
+    """
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
