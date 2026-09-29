@@ -230,12 +230,17 @@ COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split
 
 # Stesse variabili del bot: cosi' il backtest segue i parametri del bot
 LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
-BUY_USD = float(os.getenv("BUY_USD", "12"))
+BUY_USD = float(os.getenv("BUY_USD", "10"))
 DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2"))
 TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4"))
 
 # Solo backtest (l'API restituisce al massimo ~5000 candele 1h, circa 208 giorni)
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
+
+# Se impostato, il capitale iniziale del backtest e' quello reale del conto
+# (USDC + valore delle coin gestite), letto solo in lettura: non serve la
+# chiave privata, basta l'indirizzo pubblico.
+ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
 
 args = SimpleNamespace(
     capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
@@ -253,6 +258,33 @@ def log(message):
     print(f"[{now}] {message}", flush=True)
 
 
+def get_real_capital(coins, last_prices):
+    # Capitale reale sul conto: USDC + valore delle coin gestite dal bot,
+    # al prezzo di chiusura piu' recente (stesso dato del backtest, nessuna
+    # chiamata extra all'orderbook). Coin non gestite dal bot non sono incluse.
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
+    info = Info(constants.MAINNET_API_URL, skip_ws=True)
+    data = info.spot_user_state(ACCOUNT_ADDRESS)
+
+    usdc = 0.0
+    coins_value = 0.0
+
+    for balance in data.get("balances", []):
+        name = balance.get("coin")
+        total = float(balance.get("total", 0) or 0)
+
+        if name == "USDC":
+            usdc = total
+        else:
+            for coin in coins:
+                if name in (coin, "U" + coin) and coin in last_prices:
+                    coins_value += total * last_prices[coin]
+
+    return usdc + coins_value
+
+
 def run():
     data = fetch_candles(COINS, BACKTEST_DAYS, None)
 
@@ -268,6 +300,14 @@ def run():
 
     # le candele sono da 1h: il ciclo simulato non puo' essere piu' corto
     interval = max(1, round(LOOP_INTERVAL_SECONDS / 3600))
+
+    if ACCOUNT_ADDRESS:
+        try:
+            last_prices = {c: closes[c][-1] for c in closes}
+            args.capital = get_real_capital(closes, last_prices)
+            log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite, al prezzo di chiusura piu' recente)")
+        except Exception as e:
+            log(f"CAPITALE REALE ERRORE | {e} | uso BACKTEST_CAPITAL=${args.capital:.2f}")
 
     log(f"BACKTEST | coin {','.join(closes)} | {days:.0f} giorni | {len(times)} candele 1h")
 
