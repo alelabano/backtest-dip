@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument("--days", type=int, default=200)
     p.add_argument("--capital", type=float, default=1000)
     # liste separate da virgola = griglia di combinazioni
-    p.add_argument("--buy-usd", default="12")
+    p.add_argument("--buy-usd", default="10")
     p.add_argument("--dip", default="2")
     p.add_argument("--tp", default="4")
     p.add_argument("--interval", default="4", help="ore tra un ciclo e l'altro")
