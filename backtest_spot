@@ -1,20 +1,3 @@
-"""
-Backtest semplice del bot spot multi-coin (stessa logica del bot):
-- ogni ciclo: prima SELL (lotto col rendimento maggiore che ha raggiunto il target,
-  vende SELL_PERCENT%), altrimenti BUY (coin col ribasso 24h piu' forte >= DIP)
-- ribasso = (max 24h - prezzo) / max 24h, su candele da 1h (come il bot)
-- limiti: MAX_POSITION per coin, MAX_WEEKLY_BUYS globale, minimo d'ordine
-
-Esempi:
-  python backtest_spot.py
-  python backtest_spot.py --dip 2,3,4 --tp 4,6 --interval 1,4
-  python backtest_spot.py --synthetic        (dati casuali, solo per provare lo script)
-
-Approssimazioni: niente tick/szDecimals, fee uguale su entrambi i lati,
-prezzo del ciclo = chiusura della candela 1h. I dati arrivano dall'API
-Hyperliquid (max ~5000 candele 1h, circa 208 giorni) e vengono salvati in cache.
-"""
-
 import argparse
 import itertools
 import json
@@ -22,15 +5,63 @@ import os
 import random
 from datetime import datetime, timezone
 
-HOUR_MS = 3600 * 1000
+
+def get_hyperliquid_capital():
+    """
+    Legge il valore totale (USDC + token spot) dall'account Hyperliquid 
+    usando la variabile d'ambiente HYPERLIQUID_ACCOUNT_ADDRESS.
+    """
+    address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or os.getenv("HL_ACCOUNT_ADDRESS")
+    
+    # Fallback: prova a ricavarlo dalla chiave privata se non trova l'indirizzo
+    if not address:
+        secret_key = os.getenv("HYPERLIQUID_SECRET_KEY") or os.getenv("HL_SECRET_KEY")
+        if secret_key:
+            try:
+                from eth_account import Account
+                account = Account.from_key(secret_key)
+                address = account.address
+            except Exception:
+                pass
+
+    if not address:
+        print("INFO: Nessun indirizzo trovato nella variabile HYPERLIQUID_ACCOUNT_ADDRESS.")
+        return None
+
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+
+        info = Info(constants.MAINNET_API_URL, skip_ws=True)
+        user_state = info.spot_user_state(address)
+        
+        total_value = 0.0
+        balances = user_state.get("balances", [])
+        
+        # Recupera i prezzi mid di tutti i token per valorizzare l'asset spot
+        all_mids = info.all_mids() if any(float(b.get("total", 0)) > 0 for b in balances if b.get("coin") != "USDC") else {}
+
+        for b in balances:
+            token = b.get("coin")
+            total_qty = float(b.get("total", 0))
+            if token == "USDC":
+                total_value += total_qty
+            elif total_qty > 0:
+                px = float(all_mids.get(token, 0))
+                total_value += total_qty * px
+
+        print(f"Capitale rilevato da Hyperliquid ({address[:6]}...{address[-4:]}): ${total_value:.2f}")
+        return total_value
+    except Exception as e:
+        print(f"ERRORE nel recupero capitale da Hyperliquid: {e}")
+        return None
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--coins", default="HYPE,ZEC,ETH,SOL")
     p.add_argument("--days", type=int, default=200)
-    p.add_argument("--capital", type=float, default=1000)
-    # liste separate da virgola = griglia di combinazioni
+    p.add_argument("--capital", type=float, default=None, help="Capitale iniziale. Se non specificato, legge da HYPERLIQUID_ACCOUNT_ADDRESS.")
     p.add_argument("--buy-usd", default="10")
     p.add_argument("--dip", default="2")
     p.add_argument("--tp", default="4")
@@ -38,12 +69,28 @@ def parse_args():
     p.add_argument("--sell-percent", type=float, default=95)
     p.add_argument("--max-position", type=float, default=200)
     p.add_argument("--weekly-buys", type=int, default=10)
-    p.add_argument("--fee", type=float, default=0.0007, help="per lato (0.0007 = 0.07%%)")
+    p.add_argument("--fee", type=float, default=0.0007, help="per lato (0.0007 = 0.07%)")
     p.add_argument("--slippage", type=float, default=0.0005)
     p.add_argument("--min-order", type=float, default=10)
     p.add_argument("--synthetic", action="store_true")
     p.add_argument("--cache", default="candles_cache.json")
     return p.parse_args()
+
+
+def main():
+    a = parse_args()
+
+    # Priorità: 1. Flag manuale --capital, 2. API Hyperliquid, 3. Default 1000
+    if a.capital is None:
+        hl_capital = get_hyperliquid_capital()
+        if hl_capital is not None and hl_capital > 0:
+            a.capital = hl_capital
+        else:
+            print("Fallback: utilizzo capitale di default $1000.00")
+            a.capital = 1000.0
+
+    coins = [c.strip().upper() for c in a.coins.split(",") if c.strip()]
+    
 
 
 # ============================================================
