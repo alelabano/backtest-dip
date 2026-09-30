@@ -202,13 +202,13 @@ def print_report(r, a, closes, days):
     print(f"PERFORMANCE DEL BOT NEGLI ULTIMI {days:.0f} GIORNI")
     print("=" * 60)
     print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
-    print(f"Capitale iniziale         ${a.capital:>10.2f}")
-    print(f"Valore finale             ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
-    print(f"  profitto realizzato     ${r['realized']:>10.2f}")
-    print(f"  non realizzato          ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
-    print(f"Acquisti / vendite        {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
-    print(f"Max capitale investito   ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
-    print(f"Max drawdown             {r['dd']:>10.2f}%")
+    print(f"Capitale iniziale (equity odierna)  ${a.capital:>10.2f}")
+    print(f"Valore finale                       ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
+    print(f"  profitto realizzato               ${r['realized']:>10.2f}")
+    print(f"  non realizzato                     ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
+    print(f"Acquisti / vendite                  {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
+    print(f"Max capitale investito              ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
+    print(f"Max drawdown                         {r['dd']:>10.2f}%")
     print()
     print(f"{'coin':<6} {'buy':>5} {'sell':>5} {'realiz.':>9} {'non real.':>10} {'aperti':>7} {'coin nel periodo':>17}")
 
@@ -228,17 +228,22 @@ sys.stdout.reconfigure(line_buffering=True)
 
 COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split(",") if c.strip()]
 
-# Stesse variabili del bot: cosi' il backtest segue i parametri del bot
 LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
 BUY_USD = float(os.getenv("BUY_USD", "10"))
 DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2"))
 TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4"))
 
-# Solo backtest (l'API restituisce al massimo ~5000 candele 1h, circa 208 giorni)
+# L'API restituisce al massimo ~5000 candele 1h, circa 208 giorni
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Indirizzo pubblico letto dalle variabili di Railway
-ACCOUNT_ADDRESS = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or os.getenv("HL_ACCOUNT_ADDRESS")
+# Capitale iniziale del backtest = saldo reale del conto (USDC + coin gestite),
+# letto in sola lettura: NON serve la chiave privata, basta l'indirizzo pubblico.
+# Accetta uno qualsiasi di questi tre nomi di variabile.
+ACCOUNT_ADDRESS = (
+    os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
+    or os.getenv("HL_ACCOUNT_ADDRESS")
+    or os.getenv("ACCOUNT_ADDRESS")
+)
 
 args = SimpleNamespace(
     capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
@@ -257,31 +262,30 @@ def log(message):
 
 
 def get_real_capital(coins, last_prices):
-    """
-    Recupera il valore totale del conto su Hyperliquid (USDC + token gestiti) 
-    in sola lettura tramite HYPERLIQUID_ACCOUNT_ADDRESS.
-    """
+    # Saldo reale sul conto: USDC + valore delle coin gestite dal bot, al prezzo
+    # di chiusura piu' recente (stesso dato del backtest, nessuna chiamata extra
+    # all'orderbook). Coin non gestite dal bot non sono incluse.
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
     info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    data = info.spot_user_state(ACCOUNT_ADDRESS)
+    user_state = info.spot_user_state(ACCOUNT_ADDRESS)
 
-    usdc = 0.0
+    usdc_balance = 0.0
     coins_value = 0.0
 
-    for balance in data.get("balances", []):
+    for balance in user_state.get("balances", []):
         name = balance.get("coin")
         total = float(balance.get("total", 0) or 0)
 
         if name == "USDC":
-            usdc = total
+            usdc_balance = total
         else:
             for coin in coins:
                 if name in (coin, "U" + coin) and coin in last_prices:
                     coins_value += total * last_prices[coin]
 
-    return usdc + coins_value
+    return usdc_balance + coins_value
 
 
 def run():
@@ -303,10 +307,17 @@ def run():
     if ACCOUNT_ADDRESS:
         try:
             last_prices = {c: closes[c][-1] for c in closes}
-            args.capital = get_real_capital(closes, last_prices)
-            log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite, al prezzo di chiusura piu' recente)")
+            real_capital = get_real_capital(closes, last_prices)
+
+            if real_capital > 0:
+                args.capital = real_capital
+                log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite, al prezzo di chiusura piu' recente)")
+            else:
+                log(f"CAPITALE REALE nullo | uso BACKTEST_CAPITAL=${args.capital:.2f}")
         except Exception as e:
             log(f"CAPITALE REALE ERRORE | {e} | uso BACKTEST_CAPITAL=${args.capital:.2f}")
+    else:
+        log(f"HYPERLIQUID_ACCOUNT_ADDRESS non impostata | uso BACKTEST_CAPITAL=${args.capital:.2f}")
 
     log(f"BACKTEST | coin {','.join(closes)} | {days:.0f} giorni | {len(times)} candele 1h")
 
