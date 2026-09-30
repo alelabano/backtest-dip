@@ -245,6 +245,10 @@ ACCOUNT_ADDRESS = (
     or os.getenv("ACCOUNT_ADDRESS")
 )
 
+# Coin presenti sul conto ma NON gestite da questo bot (es. BTC dell'altro bot):
+# il loro valore entra nel capitale iniziale del backtest, ma non nella simulazione.
+CAPITAL_EXTRA_COINS = [c.strip().upper() for c in os.getenv("CAPITAL_EXTRA_COINS", "").split(",") if c.strip()]
+
 args = SimpleNamespace(
     capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
     sell_percent=float(os.getenv("SELL_PERCENT", "95")),
@@ -264,15 +268,37 @@ def log(message):
 def get_real_capital(coins, last_prices):
     # Saldo reale sul conto: USDC + valore delle coin gestite dal bot, al prezzo
     # di chiusura piu' recente (stesso dato del backtest, nessuna chiamata extra
-    # all'orderbook). Coin non gestite dal bot non sono incluse.
+    # all'orderbook), + valore delle coin extra (CAPITAL_EXTRA_COINS) al prezzo
+    # spot corrente, per coin sul conto ma non gestite da questo bot (es. BTC).
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
     info = Info(constants.MAINNET_API_URL, skip_ws=True)
     user_state = info.spot_user_state(ACCOUNT_ADDRESS)
 
+    extra_prices = {}
+
+    if CAPITAL_EXTRA_COINS:
+        meta = info.spot_meta()
+        usdc_idx = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
+
+        for coin in CAPITAL_EXTRA_COINS:
+            for idx, token in enumerate(meta["tokens"]):
+                if token["name"] in (coin, "U" + coin):
+                    market = next((m["name"] for m in meta["universe"] if m["tokens"] == [idx, usdc_idx]), None)
+
+                    if market:
+                        book = info.l2_snapshot(market)
+                        levels = book.get("levels", [])
+
+                        if len(levels) == 2 and levels[0] and levels[1]:
+                            extra_prices[coin] = (float(levels[0][0]["px"]) + float(levels[1][0]["px"])) / 2
+
+                    break
+
     usdc_balance = 0.0
     coins_value = 0.0
+    extra_value = 0.0
 
     for balance in user_state.get("balances", []):
         name = balance.get("coin")
@@ -280,12 +306,21 @@ def get_real_capital(coins, last_prices):
 
         if name == "USDC":
             usdc_balance = total
-        else:
-            for coin in coins:
-                if name in (coin, "U" + coin) and coin in last_prices:
-                    coins_value += total * last_prices[coin]
+            continue
 
-    return usdc_balance + coins_value
+        for coin in coins:
+            if name in (coin, "U" + coin) and coin in last_prices:
+                coins_value += total * last_prices[coin]
+                break
+        else:
+            for coin in CAPITAL_EXTRA_COINS:
+                if name in (coin, "U" + coin) and coin in extra_prices:
+                    extra_value += total * extra_prices[coin]
+                    break
+
+    log(f"CAPITALE REALE dettaglio | USDC ${usdc_balance:.2f} | coin gestite ${coins_value:.2f} | coin extra ${extra_value:.2f}")
+
+    return usdc_balance + coins_value + extra_value
 
 
 def run():
