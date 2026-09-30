@@ -138,9 +138,7 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
             sells += 1
             continue
 
-        # ---- BUY: coin col ribasso piu' forte (poi le successive se bloccata) ----
-        # riferimento: max 24h per il primo lotto della coin, poi il lotto col prezzo
-        # di acquisto piu' basso tra quelli aperti (stessa logica del bot)
+        # ---- BUY: coin col ribasso piu' forte ----
         week = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%G-W%V")
 
         drops = []
@@ -220,7 +218,7 @@ def print_report(r, a, closes, days):
     print(f"Capitale iniziale (equity odierna)  ${a.capital:>10.2f}")
     print(f"Valore finale                       ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
     print(f"  profitto realizzato               ${r['realized']:>10.2f}")
-    print(f"  non realizzato                     ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
+    print(f"  non realizzato                    ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
     print(f"Acquisti / vendite                  {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
     print(f"BUY segnalati ma saltati (fondi insuff.) {r['missed_buys']:>3}")
     print(f"Max capitale investito              ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
@@ -249,20 +247,14 @@ BUY_USD = float(os.getenv("BUY_USD", "10"))
 DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2"))
 TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4"))
 
-# L'API restituisce al massimo ~5000 candele 1h, circa 208 giorni
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Capitale iniziale del backtest = saldo reale del conto (USDC + coin gestite),
-# letto in sola lettura: NON serve la chiave privata, basta l'indirizzo pubblico.
-# Accetta uno qualsiasi di questi tre nomi di variabile.
 ACCOUNT_ADDRESS = (
     os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
     or os.getenv("HL_ACCOUNT_ADDRESS")
     or os.getenv("ACCOUNT_ADDRESS")
 )
 
-# Coin presenti sul conto ma NON gestite da questo bot (es. BTC dell'altro bot):
-# il loro valore entra nel capitale iniziale del backtest, ma non nella simulazione.
 CAPITAL_EXTRA_COINS = [c.strip().upper() for c in os.getenv("CAPITAL_EXTRA_COINS", "").split(",") if c.strip()]
 
 args = SimpleNamespace(
@@ -282,10 +274,6 @@ def log(message):
 
 
 def get_real_capital(coins, last_prices):
-    # Saldo reale sul conto: USDC + valore delle coin gestite dal bot, al prezzo
-    # di chiusura piu' recente (stesso dato del backtest, nessuna chiamata extra
-    # all'orderbook), + valore delle coin extra (CAPITAL_EXTRA_COINS) al prezzo
-    # spot corrente, per coin sul conto ma non gestite da questo bot (es. BTC).
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
@@ -366,7 +354,6 @@ def run():
 
     days = (times[-1] - times[0]) / HOUR_MS / 24
 
-    # le candele sono da 1h: il ciclo simulato non puo' essere piu' corto
     interval = max(1, round(LOOP_INTERVAL_SECONDS / 3600))
 
     if ACCOUNT_ADDRESS:
@@ -376,7 +363,7 @@ def run():
 
             if real_capital > 0:
                 args.capital = real_capital
-                log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite, al prezzo di chiusura piu' recente)")
+                log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite + extra usati come liquidita' iniziale)")
             else:
                 log(f"CAPITALE REALE nullo | uso BACKTEST_CAPITAL=${args.capital:.2f}")
         except Exception as e:
@@ -391,8 +378,6 @@ def run():
     print_report(result, args, closes, days)
 
     if result["missed_buys"] > 0:
-        # simulazione senza vincoli di cassa: quanto sarebbe sceso il saldo USDC
-        # se il bot avesse potuto comprare ogni volta che il segnale scattava
         unlimited = simulate(times, closes, highs, BUY_USD, DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args, unlimited_cash=True)
 
         required_extra = max(0.0, -unlimited["min_cash"])
