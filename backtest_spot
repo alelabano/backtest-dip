@@ -5,14 +5,15 @@ Backtest semplice del bot spot multi-coin (stessa logica del bot):
 - ribasso = (max 24h - prezzo) / max 24h, su candele da 1h (come il bot)
 - limiti: MAX_POSITION per coin, MAX_WEEKLY_BUYS globale, minimo d'ordine
 
+Se impostato ACCOUNT_ADDRESS (o flag --account-address), il capitale iniziale
+viene letto in tempo reale da Hyperliquid (Equity Totale odierna USDC + Token)
+e convertito in liquidita' iniziale USDC per il backtest.
+
 Esempi:
   python backtest_spot.py
-  python backtest_spot.py --dip 2,3,4 --tp 4,6 --interval 1,4
+  python backtest_spot.py --dip 2,3,4,5 --tp 6 --interval 1,4
+  python backtest_spot.py --account-address 0x... --dip 2,3,4 --tp 6
   python backtest_spot.py --synthetic        (dati casuali, solo per provare lo script)
-
-Approssimazioni: niente tick/szDecimals, fee uguale su entrambi i lati,
-prezzo del ciclo = chiusura della candela 1h. I dati arrivano dall'API
-Hyperliquid (max ~5000 candele 1h, circa 208 giorni) e vengono salvati in cache.
 """
 
 import argparse
@@ -20,35 +21,74 @@ import itertools
 import json
 import os
 import random
+import sys
 from datetime import datetime, timezone
 
+from dotenv import load_dotenv
+
 HOUR_MS = 3600 * 1000
+
+load_dotenv()
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--coins", default="HYPE,ZEC,ETH,SOL")
-    p.add_argument("--days", type=int, default=200)
-    p.add_argument("--capital", type=float, default=1000)
+    p.add_argument("--coins", default=os.getenv("COINS", "HYPE,ZEC,ETH,SOL"))
+    p.add_argument("--days", type=int, default=min(int(os.getenv("BACKTEST_DAYS", "200")), 208))
+    p.add_argument("--capital", type=float, default=float(os.getenv("BACKTEST_CAPITAL", "1000")))
     # liste separate da virgola = griglia di combinazioni
-    p.add_argument("--buy-usd", default="10")
-    p.add_argument("--dip", default="2")
-    p.add_argument("--tp", default="4")
-    p.add_argument("--interval", default="4", help="ore tra un ciclo e l'altro")
-    p.add_argument("--sell-percent", type=float, default=95)
-    p.add_argument("--max-position", type=float, default=200)
-    p.add_argument("--weekly-buys", type=int, default=10)
-    p.add_argument("--fee", type=float, default=0.0007, help="per lato (0.0007 = 0.07%%)")
-    p.add_argument("--slippage", type=float, default=0.0005)
-    p.add_argument("--min-order", type=float, default=10)
+    p.add_argument("--buy-usd", default=os.getenv("BUY_USD", "10"))
+    p.add_argument("--dip", default=os.getenv("DIP_PERCENT", "2"))
+    p.add_argument("--tp", default=os.getenv("TAKE_PROFIT_PERCENT", "6"))
+    p.add_argument("--interval", default=str(round(int(os.getenv("LOOP_INTERVAL_SECONDS", "14400")) / 3600)), help="ore tra un ciclo e l'altro")
+    p.add_argument("--sell-percent", type=float, default=float(os.getenv("SELL_PERCENT", "95")))
+    p.add_argument("--max-position", type=float, default=float(os.getenv("MAX_POSITION_USD", "200")))
+    p.add_argument("--weekly-buys", type=int, default=int(os.getenv("MAX_WEEKLY_BUYS", "10")))
+    p.add_argument("--fee", type=float, default=float(os.getenv("BACKTEST_FEE", "0.0007")), help="per lato (0.0007 = 0.07%%)")
+    p.add_argument("--slippage", type=float, default=float(os.getenv("BACKTEST_SLIPPAGE", "0.0005")))
+    p.add_argument("--min-order", type=float, default=float(os.getenv("MIN_ORDER_USD", "10")))
+    p.add_argument("--account-address", default=os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS") or os.getenv("HL_ACCOUNT_ADDRESS") or os.getenv("ACCOUNT_ADDRESS"))
     p.add_argument("--synthetic", action="store_true")
     p.add_argument("--cache", default="candles_cache.json")
     return p.parse_args()
 
 
 # ============================================================
-# DATI
+# DATI E CONTO REALE
 # ============================================================
+
+def get_real_capital(account_address, coins, last_prices):
+    """
+    Recupera l'Equity Totale odierna su Hyperliquid (USDC + token gestiti)
+    e la converte in un valore unico da usare come liquidita' iniziale USDC.
+    """
+    try:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+
+        info = Info(constants.MAINNET_API_URL, skip_ws=True)
+        user_state = info.spot_user_state(account_address)
+
+        usdc_balance = 0.0
+        coins_value = 0.0
+
+        for balance in user_state.get("balances", []):
+            name = balance.get("coin")
+            total = float(balance.get("total", 0) or 0)
+
+            if name == "USDC":
+                usdc_balance = total
+            else:
+                for coin in coins:
+                    if name in (coin, "U" + coin) and coin in last_prices:
+                        coins_value += total * last_prices[coin]
+
+        total_equity = usdc_balance + coins_value
+        return total_equity if total_equity > 0 else None
+    except Exception as e:
+        print(f"ATTENZIONE: Errore nel recupero dell'Equity Reale da Hyperliquid: {e}")
+        return None
+
 
 def fetch_candles(coins, days, cache):
     if os.path.exists(cache):
@@ -183,9 +223,7 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
             sells += 1
             continue
 
-        # ---- BUY: coin col ribasso piu' forte (poi le successive se bloccata) ----
-        # riferimento: max 24h per il primo lotto della coin, poi il lotto col prezzo
-        # di acquisto piu' basso tra quelli aperti (stessa logica del bot)
+        # ---- BUY: coin col ribasso piu' forte ----
         week = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%G-W%V")
 
         drops = []
@@ -262,11 +300,11 @@ def print_report(r, a, closes, days):
     print(f"PERFORMANCE DEL BOT NEGLI ULTIMI {days:.0f} GIORNI")
     print("=" * 60)
     print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
-    print(f"Capitale iniziale        ${a.capital:>10.2f}")
-    print(f"Valore finale            ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
-    print(f"  profitto realizzato    ${r['realized']:>10.2f}")
-    print(f"  non realizzato         ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
-    print(f"Acquisti / vendite       {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
+    print(f"Capitale iniziale         ${a.capital:>10.2f}")
+    print(f"Valore finale             ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
+    print(f"  profitto realizzato     ${r['realized']:>10.2f}")
+    print(f"  non realizzato          ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
+    print(f"Acquisti / vendite        {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
     print(f"BUY segnalati ma saltati (fondi insuff.) {r['missed_buys']:>3}")
     print(f"Max capitale investito   ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
     print(f"Max drawdown             {r['dd']:>10.2f}%")
@@ -297,11 +335,19 @@ def main():
     start = datetime.fromtimestamp(times[0] / 1000, timezone.utc).strftime("%Y-%m-%d")
     end = datetime.fromtimestamp(times[-1] / 1000, timezone.utc).strftime("%Y-%m-%d")
 
+    # Recupera il capitale reale odierno se specificato l'account address
+    if a.account_address and not a.synthetic:
+        last_prices = {c: closes[c][-1] for c in closes}
+        real_capital = get_real_capital(a.account_address, closes, last_prices)
+        if real_capital:
+            a.capital = real_capital
+            print(f"CAPITALE REALE RILEVATO: ${a.capital:.2f} (Equity totale odierna usata come liquidita' iniziale USDC)\n")
+
     bh = sum(closes[c][-1] / closes[c][23] - 1 for c in closes) / len(closes) * 100
 
     print(f"Periodo {start} -> {end} ({days:.0f} giorni, {len(times)} candele 1h) | coin {','.join(closes)}")
     print(f"Buy&hold equipesato (riferimento, non stessa esposizione): {bh:+.1f}%")
-    print(f"Capitale {a.capital:.0f} | fee {a.fee * 100:.3f}% e slippage {a.slippage * 100:.3f}% per lato | sell {a.sell_percent:.0f}%\n")
+    print(f"Capitale {a.capital:.2f} | fee {a.fee * 100:.3f}% e slippage {a.slippage * 100:.3f}% per lato | sell {a.sell_percent:.0f}%\n")
 
     grid = itertools.product(
         [float(x) for x in a.buy_usd.split(",")],
