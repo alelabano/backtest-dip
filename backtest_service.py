@@ -279,22 +279,36 @@ def get_real_capital(coins, last_prices):
     extra_prices = {}
 
     if CAPITAL_EXTRA_COINS:
+        log(f"CAPITALE REALE | coin extra configurate: {CAPITAL_EXTRA_COINS}")
+
         meta = info.spot_meta()
         usdc_idx = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
 
         for coin in CAPITAL_EXTRA_COINS:
+            found_token = False
+
             for idx, token in enumerate(meta["tokens"]):
                 if token["name"] in (coin, "U" + coin):
+                    found_token = True
+
                     market = next((m["name"] for m in meta["universe"] if m["tokens"] == [idx, usdc_idx]), None)
 
-                    if market:
-                        book = info.l2_snapshot(market)
-                        levels = book.get("levels", [])
+                    if not market:
+                        log(f"CAPITALE REALE | {coin}: token trovato ma nessun mercato spot {coin}/USDC")
+                        break
 
-                        if len(levels) == 2 and levels[0] and levels[1]:
-                            extra_prices[coin] = (float(levels[0][0]["px"]) + float(levels[1][0]["px"])) / 2
+                    book = info.l2_snapshot(market)
+                    levels = book.get("levels", [])
+
+                    if len(levels) == 2 and levels[0] and levels[1]:
+                        extra_prices[coin] = (float(levels[0][0]["px"]) + float(levels[1][0]["px"])) / 2
+                    else:
+                        log(f"CAPITALE REALE | {coin}: orderbook {market} vuoto o non disponibile")
 
                     break
+
+            if not found_token:
+                log(f"CAPITALE REALE | {coin}: nessun token '{coin}' o 'U{coin}' nei metadata Spot")
 
     usdc_balance = 0.0
     coins_value = 0.0
