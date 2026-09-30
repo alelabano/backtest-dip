@@ -87,7 +87,7 @@ def align(data):
 # SIMULAZIONE
 # ============================================================
 
-def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
+def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash=False):
     coins = list(closes)
 
     usdc = a.capital
@@ -101,6 +101,8 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
     max_dd = 0.0
     max_deployed = 0.0
     per = {c: {"buys": 0, "sells": 0, "realized": 0.0} for c in coins}
+    missed_buys = 0
+    min_cash = a.capital
 
     for i in range(23, len(times), interval):
         px = {c: closes[c][i] for c in coins}
@@ -155,24 +157,35 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
 
         drops.sort(reverse=True)
 
+        cash_blocked = False
+
         for drop, c in drops:
             if drop < dip:
                 break
 
             held = sum(l["qty"] for l in lots if l["coin"] == c) * px[c]
 
-            if held + buy_usd > a.max_position or weekly.get(week, 0) >= a.weekly_buys or usdc < buy_usd:
+            if held + buy_usd > a.max_position or weekly.get(week, 0) >= a.weekly_buys:
+                continue
+
+            if not unlimited_cash and usdc < buy_usd:
+                cash_blocked = True
                 continue
 
             fill = px[c] * (1 + a.slippage)
             qty = buy_usd / fill * (1 - a.fee)
 
             usdc -= buy_usd
+            min_cash = min(min_cash, usdc)
             lots.append({"coin": c, "qty": qty, "buy_price": fill, "target": fill * (1 + tp / 100), "cost": buy_usd / qty})
             weekly[week] = weekly.get(week, 0) + 1
             per[c]["buys"] += 1
             buys += 1
+            cash_blocked = False
             break
+
+        if cash_blocked:
+            missed_buys += 1
 
     last = {c: closes[c][-1] for c in coins}
     open_value = sum(l["qty"] * last[l["coin"]] for l in lots)
@@ -194,6 +207,8 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a):
         "dd": max_dd,
         "deployed": max_deployed,
         "per": per,
+        "missed_buys": missed_buys,
+        "min_cash": min_cash,
     }
 
 
@@ -207,6 +222,7 @@ def print_report(r, a, closes, days):
     print(f"  profitto realizzato               ${r['realized']:>10.2f}")
     print(f"  non realizzato                     ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
     print(f"Acquisti / vendite                  {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
+    print(f"BUY segnalati ma saltati (fondi insuff.) {r['missed_buys']:>3}")
     print(f"Max capitale investito              ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
     print(f"Max drawdown                         {r['dd']:>10.2f}%")
     print()
@@ -373,6 +389,28 @@ def run():
     result = simulate(times, closes, highs, BUY_USD, DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args)
 
     print_report(result, args, closes, days)
+
+    if result["missed_buys"] > 0:
+        # simulazione senza vincoli di cassa: quanto sarebbe sceso il saldo USDC
+        # se il bot avesse potuto comprare ogni volta che il segnale scattava
+        unlimited = simulate(times, closes, highs, BUY_USD, DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args, unlimited_cash=True)
+
+        required_extra = max(0.0, -unlimited["min_cash"])
+        required_capital = args.capital + required_extra
+
+        log(
+            f"CAPITALE NECESSARIO | per non saltare nessun BUY negli ultimi {days:.0f} giorni "
+            f"servirebbero almeno ${required_capital:.2f} (attuale ${args.capital:.2f}, "
+            f"mancano ${required_extra:.2f})"
+        )
+
+        args_sufficient = SimpleNamespace(**vars(args))
+        args_sufficient.capital = required_capital
+
+        result_sufficient = simulate(times, closes, highs, BUY_USD, DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args_sufficient)
+
+        print(f"\nPROFITTABILITA' CON CAPITALE SUFFICIENTE (${required_capital:.2f}, nessun BUY saltato)")
+        print_report(result_sufficient, args_sufficient, closes, days)
 
 
 if __name__ == "__main__":
