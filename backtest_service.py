@@ -1,26 +1,30 @@
 """
-Servizio backtest per Railway con ricerca del DIP % per FREQUENZA, non per
-massimo rendimento sull'intero periodo.
+Servizio backtest per Railway. Ogni LOOP_INTERVAL_SECONDS (default 4 ore) fa
+due cose distinte:
 
-Il massimo rendimento su un unico periodo di 200 giorni puo' premiare un
-singolo caso isolato (un DIP che ha funzionato bene una volta per caso).
-Per questo i 200 giorni vengono divisi in finestre piu' corte e sovrapposte
-(WINDOW_DAYS, passo STEP_DAYS): per ogni finestra si trova il DIP col
-rendimento migliore, e si conta quante volte ciascun DIP vince. Il DIP
-scelto per il report e' quello che vince piu' spesso, non quello col
-rendimento piu' alto sul periodo intero (che resta mostrato solo come
-informazione, non come criterio di scelta).
+1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT: simula il bot con i
+   parametri realmente in uso (DIP_PERCENT e TAKE_PROFIT_PERCENT letti
+   dall'ambiente, gli stessi del bot vero) sugli ultimi BACKTEST_DAYS giorni,
+   e calcola quanto capitale servirebbe per non saltare nessun BUY.
 
-TP resta fisso (default 6%, vedi nota sotto) e non entra nella ricerca.
+2) ANALISI ESPLORATIVA DEL DIP: SOLO INFORMATIVA, non cambia il bot. Prova
+   una griglia di valori di DIP_PERCENT costruita sui ribassi realmente
+   osservati nei dati (percentili della distribuzione, non una lista
+   fissa), e sceglie quello che vince piu' spesso su finestre piu' corte
+   dentro il periodo (non quello col rendimento massimo sul periodo intero,
+   che premia facilmente un singolo caso isolato). Un pareggio tra valori
+   lontani tra loro (es. l'estremo piu' basso e quello piu' alto) e' un
+   segnale di periodi con regimi diversi, non va risolto in silenzio: viene
+   segnalato esplicitamente.
+
 Include il calcolo del capitale reale (USDC + coin gestite + coin extra) e
 la gestione dei BUY saltati per fondi insufficienti.
 
-Nota sul TP fisso al 6%: con BUY_USD basso e SELL_PERCENT=95, il 95% di un
-lotto vale meno del minimo d'ordine finche' il prezzo non e' salito di
-circa il 100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95, BUY_USD
-vicino a MIN_ORDER_USD). Un TAKE_PROFIT_PERCENT sotto quella soglia non ha
-alcun effetto, perche' il lotto resta scartato dal controllo sul minimo
-d'ordine indipendentemente dal target. 6% e' sopra quella soglia.
+Nota sul TP: con BUY_USD basso e SELL_PERCENT=95, il 95% di un lotto vale
+meno del minimo d'ordine finche' il prezzo non e' salito di circa
+100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95). Un
+TAKE_PROFIT_PERCENT sotto quella soglia non ha alcun effetto: il lotto resta
+scartato dal controllo sul minimo d'ordine indipendentemente dal target.
 """
 
 import json
@@ -223,9 +227,9 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
     }
 
 
-def print_report(r, a, closes, days):
+def print_report(title, r, a, closes, days):
     print("=" * 60)
-    print(f"PERFORMANCE DEL BOT NEGLI ULTIMI {days:.0f} GIORNI")
+    print(title)
     print("=" * 60)
     print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
     print(f"Capitale iniziale (equity odierna)  ${a.capital:>10.2f}")
@@ -245,8 +249,17 @@ def print_report(r, a, closes, days):
     print("=" * 60, flush=True)
 
 
+def capital_needed(times, closes, highs, buy_usd, dip, tp, interval, a):
+    # Quanto capitale servirebbe per non saltare nessun BUY: rifa la
+    # simulazione permettendo al saldo USDC di andare virtualmente sotto
+    # zero, e misura il punto peggiore raggiunto.
+    unlimited = simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash=True)
+    required_extra = max(0.0, -unlimited["min_cash"])
+    return a.capital + required_extra
+
+
 # ============================================================
-# SERVIZIO E RICERCA DIP ROBUSTA
+# SERVIZIO
 # ============================================================
 
 load_dotenv()
@@ -257,16 +270,19 @@ COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split
 LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
 BUY_USD = float(os.getenv("BUY_USD", "10"))
 
-# Target Take Profit fisso (vedi nota sul minimo d'ordine in testa al file)
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "6.0"))
+# Parametri REALMENTE in uso sul bot: per il confronto "capitale necessario
+# per i parametri attuali", tienili identici a quelli del servizio bot.
+CURRENT_DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2.0"))
+TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4.0"))
 
 # L'API restituisce al massimo ~5000 candele 1h, circa 208 giorni
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Ricerca del DIP per frequenza di vittoria su finestre sovrapposte, non per
-# rendimento massimo sull'intero periodo (che puo' premiare un caso isolato).
+# Analisi esplorativa del DIP per frequenza di vittoria su finestre
+# sovrapposte dentro il periodo (solo informativa, non applicata al bot)
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 STEP_DAYS = int(os.getenv("STEP_DAYS", "10"))
+GRID_SIZE = int(os.getenv("GRID_SIZE", "8"))
 
 # Capitale iniziale del backtest = saldo reale del conto (USDC + coin gestite
 # + coin extra), letto in sola lettura: NON serve la chiave privata, basta
@@ -312,8 +328,6 @@ def get_real_capital(coins, last_prices):
     extra_prices = {}
 
     if CAPITAL_EXTRA_COINS:
-        log(f"CAPITALE REALE | coin extra configurate: {CAPITAL_EXTRA_COINS}")
-
         meta = info.spot_meta()
         usdc_idx = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
 
@@ -365,16 +379,65 @@ def get_real_capital(coins, last_prices):
                     extra_value += total * extra_prices[coin]
                     break
 
-    log(f"CAPITALE REALE dettaglio | USDC ${usdc_balance:.2f} | coin gestite ${coins_value:.2f} | coin extra ${extra_value:.2f}")
+    log(f"CAPITALE REALE | USDC ${usdc_balance:.2f} + coin gestite ${coins_value:.2f} + coin extra ${extra_value:.2f} = ${usdc_balance + coins_value + extra_value:.2f}")
 
     return usdc_balance + coins_value + extra_value
 
 
+def build_dip_grid(closes, highs):
+    # Griglia adattiva: percentili della distribuzione dei ribassi REALMENTE
+    # osservati nei dati (rispetto al massimo mobile a 24h), non una lista
+    # fissa. Cosi' la griglia si adatta alla volativa' effettiva delle coin
+    # configurate in questo periodo, invece di provare valori arbitrari che
+    # potrebbero essere tutti troppo bassi (coin poco volatili) o tutti
+    # troppo alti (coin molto volatili).
+    drops = []
+
+    for c, cl in closes.items():
+        hi = highs[c]
+
+        for i in range(23, len(cl)):
+            h24 = max(hi[i - 23:i + 1])
+
+            if h24 > 0:
+                d = (h24 - cl[i]) / h24 * 100
+
+                if d > 0:
+                    drops.append(d)
+
+    if not drops:
+        return [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+    drops.sort()
+
+    n = len(drops)
+    # Percentili alti: solo la "coda" della distribuzione rappresenta ribassi
+    # degni di nota: la maggior parte del tempo il prezzo e' vicino al suo
+    # massimo a 24h, quindi i percentili bassi darebbero soglie vicine a 0.
+    percentiles = [40, 52, 64, 74, 83, 90, 95, 98.5][:GRID_SIZE] if GRID_SIZE < 8 else \
+        [round(40 + i * (98.5 - 40) / (GRID_SIZE - 1), 1) for i in range(GRID_SIZE)]
+
+    grid = []
+
+    for p in percentiles:
+        idx = min(int(n * p / 100), n - 1)
+        grid.append(round(drops[idx] * 2) / 2)  # arrotonda a 0.5
+
+    # dedup mantenendo l'ordine, e garantisce almeno 0.5% come minimo
+    seen = set()
+    out = []
+
+    for v in grid:
+        v = max(0.5, v)
+
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    return sorted(out)
+
+
 def find_robust_dip(times, closes, highs, dip_candidates, interval, days, results):
-    # Finestre di WINDOW_DAYS giorni, che scorrono di STEP_DAYS, dentro il
-    # periodo scaricato. Ogni finestra riparte dallo stesso capitale (sono
-    # periodi indipendenti tra loro, non un'unica simulazione incatenata):
-    # l'obiettivo e' vedere quale DIP vince piu' spesso, non accumulare PnL.
     window_candles = int(WINDOW_DAYS * 24)
     step_candles = max(1, int(STEP_DAYS * 24))
 
@@ -402,21 +465,16 @@ def find_robust_dip(times, closes, highs, dip_candidates, interval, days, result
         windows_tested += 1
         start += step_candles
 
-    log(f"RICERCA DIP ROBUSTA | {windows_tested} finestre da {WINDOW_DAYS}gg (passo {STEP_DAYS}gg) dentro gli ultimi {days:.0f}gg")
-
-    print("\n" + "=" * 60)
-    print(f"FREQUENZA VITTORIE PER DIP % (su {windows_tested} finestre da {WINDOW_DAYS}gg)")
-    print("=" * 60)
-    print(f"{'DIP %':<7} {'Vittorie':>9} {'% finestre':>12}")
+    print(f"\nFREQUENZA VITTORIE SU {windows_tested} FINESTRE DA {WINDOW_DAYS}gg (passo {STEP_DAYS}gg)")
+    print("-" * 40)
 
     for d in dip_candidates:
         pct = wins[d] / windows_tested * 100 if windows_tested else 0
-        print(f"{d:<7.1f}% {wins[d]:>9} {pct:>11.1f}%")
-
-    print("=" * 60)
+        bar = "#" * round(pct / 5)
+        print(f"DIP {d:>5.1f}% | {wins[d]:>2} vittorie ({pct:>4.0f}%) {bar}")
 
     if windows_tested == 0:
-        log(f"RICERCA DIP ROBUSTA | periodo troppo corto per finestre da {WINDOW_DAYS}gg, uso il primo DIP della lista")
+        log(f"RICERCA DIP | periodo troppo corto per finestre da {WINDOW_DAYS}gg")
         return dip_candidates[0], wins
 
     max_wins = max(wins.values())
@@ -425,30 +483,20 @@ def find_robust_dip(times, closes, highs, dip_candidates, interval, days, result
 
     if len(tied) == 1:
         robust_dip = tied[0]
-        print(f"-> DIP PIU' FREQUENTE: {robust_dip}% (vince nel {tied_pct:.0f}% delle finestre)")
+        print(f"\n-> DIP PIU' FREQUENTE: {robust_dip:.1f}% (vince nel {tied_pct:.0f}% delle finestre)\n")
     else:
-        # Pareggio: nessun DIP e' davvero piu' frequente degli altri. Lo
-        # segnaliamo invece di sceglierne uno in modo silenzioso. Come
-        # criterio SECONDARIO (debole) si usa il rendimento sull'intero
-        # periodo tra i soli valori in pareggio, ma il pareggio stesso e'
-        # un segnale che il periodo analizzato non ha un DIP chiaramente
-        # migliore: valori molto diversi tra loro (es. l'estremo piu'
-        # basso e l'estremo piu' alto della griglia) possono indicare
-        # regimi di mercato diversi dentro lo stesso periodo, non rumore.
         by_ret = {r["dip"]: r["ret"] for r in results}
         robust_dip = max(tied, key=lambda d: by_ret.get(d, float("-inf")))
-
         tied_str = ", ".join(f"{d:.1f}%" for d in tied)
-        print(f"-> PAREGGIO tra {len(tied)} valori (tutti nel {tied_pct:.0f}% delle finestre): {tied_str}")
-        print(f"   Nessun DIP e' chiaramente piu' frequente degli altri in questo periodo.")
-        print(f"   Scelto {robust_dip:.1f}% come criterio secondario (rendimento piu' alto sull'intero periodo tra i valori in pareggio).")
 
-    print("=" * 60 + "\n", flush=True)
+        print(f"\n-> PAREGGIO nel {tied_pct:.0f}% delle finestre tra: {tied_str}")
+        print("   Nessun DIP e' chiaramente piu' frequente: questo periodo ha probabilmente regimi diversi.")
+        print(f"   Scelto {robust_dip:.1f}% come criterio secondario (rendimento piu' alto sul periodo intero tra i pareggiati).\n")
 
     return robust_dip, wins
 
 
-def run_optimization():
+def run():
     data = fetch_candles(COINS, BACKTEST_DAYS, None)
 
     if not data:
@@ -469,7 +517,6 @@ def run_optimization():
 
             if real_capital > 0:
                 args.capital = real_capital
-                log(f"CAPITALE REALE | ${args.capital:.2f} (USDC + coin gestite + extra usati come liquidita' iniziale)")
             else:
                 log(f"CAPITALE REALE nullo | uso BACKTEST_CAPITAL=${args.capital:.2f}")
         except Exception as e:
@@ -477,60 +524,58 @@ def run_optimization():
     else:
         log(f"HYPERLIQUID_ACCOUNT_ADDRESS non impostata | uso BACKTEST_CAPITAL=${args.capital:.2f}")
 
-    log(f"AVVIO RICERCA DIP (TP FISSO = {TAKE_PROFIT_PERCENT}%) su {days:.0f} giorni")
+    log(f"BACKTEST | coin {','.join(closes)} | {days:.0f} giorni | {len(times)} candele 1h | capitale ${args.capital:.2f}")
 
-    dip_candidates = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0]
+    # ========================================================
+    # 1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT
+    # ========================================================
+    current_result = simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args)
+    current_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args)
 
-    # Rendimento sull'intero periodo: utile da vedere, ma NON e' il criterio
-    # di scelta (premia facilmente un singolo caso isolato, non un pattern
-    # che si ripete).
+    print(f"\n{'#' * 60}")
+    print(f"# PARAMETRI ATTUALI DEL BOT: DIP {CURRENT_DIP_PERCENT:.1f}% | TP {TAKE_PROFIT_PERCENT:.1f}%")
+    print(f"{'#' * 60}")
+    print(f"Capitale attuale:    ${args.capital:>10.2f}")
+    print(f"BUY saltati (200gg): {current_result['missed_buys']:>10}")
+    print(f"Capitale necessario per non saltarne nessuno: ${current_required:.2f}", end="")
+    print(f"  (mancano ${max(0.0, current_required - args.capital):.2f})" if current_required > args.capital else "  (sufficiente)")
+    print(f"{'#' * 60}\n", flush=True)
+
+    print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {TAKE_PROFIT_PERCENT:.1f}%)", current_result, args, closes, days)
+
+    # ========================================================
+    # 2) ANALISI ESPLORATIVA DEL DIP (solo informativa)
+    # ========================================================
+    dip_candidates = build_dip_grid(closes, highs)
+
+    print(f"\nANALISI ESPLORATIVA DEL DIP (non applicata al bot) | griglia adattata ai dati: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
+
     results = [simulate(times, closes, highs, BUY_USD, dip, TAKE_PROFIT_PERCENT, interval, args) for dip in dip_candidates]
 
-    print("\n" + "=" * 90)
-    print(f"RENDIMENTO SULL'INTERO PERIODO PER DIP % (solo informativo, TP fisso {TAKE_PROFIT_PERCENT}%)")
-    print("=" * 90)
-    print(f"{'DIP %':<7} {'Rendimento':>12} {'Valore Fin.':>12} {'Realizzato':>12} {'Buys/Sells':>12} {'Saltati':>8} {'Open':>6} {'Max DD':>9}")
-    print("-" * 90)
-
-    for r in results:
-        print(f"{r['dip']:<7.1f}% {r['ret']:>11.2f}% ${r['final']:>11.2f} ${r['realized']:>11.2f} {r['buys']:>5}/{r['sells']:<5} {r['missed_buys']:>8} {r['open']:>6} {r['dd']:>8.1f}%")
-
-    print("=" * 90 + "\n", flush=True)
-
-    # Scelta del DIP: quello che vince piu' spesso su finestre piu' corte
-    # dentro il periodo, non quello col rendimento massimo sul periodo intero.
     robust_dip, _wins = find_robust_dip(times, closes, highs, dip_candidates, interval, days, results)
 
-    best_res = next(r for r in results if r["dip"] == robust_dip)
+    if robust_dip != CURRENT_DIP_PERCENT:
+        robust_result = next(r for r in results if r["dip"] == robust_dip)
+        robust_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, TAKE_PROFIT_PERCENT, interval, args)
 
-    print_report(best_res, args, closes, days)
-
-    # Se la scelta robusta ha saltato dei BUY per mancanza di liquidita', simula con capitale sufficiente
-    if best_res["missed_buys"] > 0:
-        unlimited = simulate(times, closes, highs, BUY_USD, robust_dip, TAKE_PROFIT_PERCENT, interval, args, unlimited_cash=True)
-
-        required_extra = max(0.0, -unlimited["min_cash"])
-        required_capital = args.capital + required_extra
-
-        log(
-            f"CAPITALE NECESSARIO | per non saltare nessun BUY con DIP {robust_dip}% negli ultimi {days:.0f} giorni "
-            f"servirebbero almeno ${required_capital:.2f} (attuale ${args.capital:.2f}, mancano ${required_extra:.2f})"
-        )
-
-        args_sufficient = SimpleNamespace(**vars(args))
-        args_sufficient.capital = required_capital
-
-        result_sufficient = simulate(times, closes, highs, BUY_USD, robust_dip, TAKE_PROFIT_PERCENT, interval, args_sufficient)
-
-        print(f"\nPROFITTABILITA' CON CAPITALE SUFFICIENTE (${required_capital:.2f}, nessun BUY saltato su DIP {robust_dip}%)")
-        print_report(result_sufficient, args_sufficient, closes, days)
+        print(f"{'-' * 60}")
+        print(f"CONFRONTO: parametri attuali (DIP {CURRENT_DIP_PERCENT:.1f}%) vs DIP piu' frequente (DIP {robust_dip:.1f}%)")
+        print(f"{'-' * 60}")
+        print(f"{'':25} {'attuale':>15} {'piu'' frequente':>18}")
+        print(f"{'DIP':<25} {CURRENT_DIP_PERCENT:>14.1f}% {robust_dip:>17.1f}%")
+        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_result['ret']:>17.2f}%")
+        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_result['missed_buys']:>18}")
+        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_required:>17.2f}")
+        print(f"{'-' * 60}\n", flush=True)
+    else:
+        log(f"Il DIP attuale ({CURRENT_DIP_PERCENT:.1f}%) coincide con quello piu' frequente trovato nell'analisi esplorativa.")
 
 
 if __name__ == "__main__":
     while True:
         try:
-            run_optimization()
+            run()
         except Exception as e:
-            log(f"ERRORE OPTIMIZATION | {e}\n{traceback.format_exc()}")
+            log(f"ERRORE BACKTEST | {e}\n{traceback.format_exc()}")
 
         time.sleep(LOOP_INTERVAL_SECONDS)
