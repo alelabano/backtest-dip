@@ -370,7 +370,7 @@ def get_real_capital(coins, last_prices):
     return usdc_balance + coins_value + extra_value
 
 
-def find_robust_dip(times, closes, highs, dip_candidates, interval, days):
+def find_robust_dip(times, closes, highs, dip_candidates, interval, days, results):
     # Finestre di WINDOW_DAYS giorni, che scorrono di STEP_DAYS, dentro il
     # periodo scaricato. Ogni finestra riparte dallo stesso capitale (sono
     # periodi indipendenti tra loro, non un'unica simulazione incatenata):
@@ -419,10 +419,30 @@ def find_robust_dip(times, closes, highs, dip_candidates, interval, days):
         log(f"RICERCA DIP ROBUSTA | periodo troppo corto per finestre da {WINDOW_DAYS}gg, uso il primo DIP della lista")
         return dip_candidates[0], wins
 
-    robust_dip = max(dip_candidates, key=lambda d: wins[d])
-    robust_pct = wins[robust_dip] / windows_tested * 100
+    max_wins = max(wins.values())
+    tied = [d for d in dip_candidates if wins[d] == max_wins]
+    tied_pct = max_wins / windows_tested * 100
 
-    print(f"-> DIP PIU' FREQUENTE: {robust_dip}% (vince nel {robust_pct:.0f}% delle finestre)")
+    if len(tied) == 1:
+        robust_dip = tied[0]
+        print(f"-> DIP PIU' FREQUENTE: {robust_dip}% (vince nel {tied_pct:.0f}% delle finestre)")
+    else:
+        # Pareggio: nessun DIP e' davvero piu' frequente degli altri. Lo
+        # segnaliamo invece di sceglierne uno in modo silenzioso. Come
+        # criterio SECONDARIO (debole) si usa il rendimento sull'intero
+        # periodo tra i soli valori in pareggio, ma il pareggio stesso e'
+        # un segnale che il periodo analizzato non ha un DIP chiaramente
+        # migliore: valori molto diversi tra loro (es. l'estremo piu'
+        # basso e l'estremo piu' alto della griglia) possono indicare
+        # regimi di mercato diversi dentro lo stesso periodo, non rumore.
+        by_ret = {r["dip"]: r["ret"] for r in results}
+        robust_dip = max(tied, key=lambda d: by_ret.get(d, float("-inf")))
+
+        tied_str = ", ".join(f"{d:.1f}%" for d in tied)
+        print(f"-> PAREGGIO tra {len(tied)} valori (tutti nel {tied_pct:.0f}% delle finestre): {tied_str}")
+        print(f"   Nessun DIP e' chiaramente piu' frequente degli altri in questo periodo.")
+        print(f"   Scelto {robust_dip:.1f}% come criterio secondario (rendimento piu' alto sull'intero periodo tra i valori in pareggio).")
+
     print("=" * 60 + "\n", flush=True)
 
     return robust_dip, wins
@@ -479,7 +499,7 @@ def run_optimization():
 
     # Scelta del DIP: quello che vince piu' spesso su finestre piu' corte
     # dentro il periodo, non quello col rendimento massimo sul periodo intero.
-    robust_dip, _wins = find_robust_dip(times, closes, highs, dip_candidates, interval, days)
+    robust_dip, _wins = find_robust_dip(times, closes, highs, dip_candidates, interval, days, results)
 
     best_res = next(r for r in results if r["dip"] == robust_dip)
 
