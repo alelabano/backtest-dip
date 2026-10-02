@@ -553,6 +553,47 @@ def find_robust_param(label, times, closes, highs, candidates, interval, days, s
     return robust_v, wins
 
 
+def verdict_text(current, combined, current_required, combined_required):
+    # Giudizio esplicito, non solo numeri: confronta lo scenario combinato
+    # (DIP e TP piu' frequenti, trovati in cascata) con quello attuale su
+    # tre assi — rendimento, BUY saltati, capitale necessario — perche' una
+    # frequenza di vittoria alta su finestre brevi NON garantisce un
+    # risultato migliore sul periodo intero (un TP alto, per esempio, puo'
+    # vincere spesso in finestre isolate e allo stesso tempo bloccare piu'
+    # capitale sul periodo intero, con piu' BUY saltati).
+    better_ret = combined["ret"] > current["ret"]
+    not_worse_missed = combined["missed_buys"] <= current["missed_buys"]
+    not_worse_capital = combined_required <= current_required
+
+    if better_ret and not_worse_missed and not_worse_capital:
+        return (
+            "MIGLIORAMENTO su tutti gli indicatori: rendimento piu' alto, BUY saltati non "
+            "peggiori, capitale necessario non superiore. E' il caso piu' solido per valutare "
+            "un cambio dei parametri, ma resta un risultato su un solo periodo passato."
+        )
+
+    if better_ret and (not not_worse_missed or not not_worse_capital):
+        problems = []
+
+        if not not_worse_missed:
+            problems.append(f"salta piu' BUY ({combined['missed_buys']} contro {current['missed_buys']})")
+
+        if not not_worse_capital:
+            problems.append(f"richiede piu' capitale (${combined_required:.2f} contro ${current_required:.2f})")
+
+        return (
+            f"RENDIMENTO PIU' ALTO ma non e' un miglioramento netto: {' e '.join(problems)}. "
+            "La frequenza di vittoria alta nelle finestre brevi non si traduce in un vantaggio "
+            "pulito sul periodo intero: valutalo con cautela, non applicarlo solo perche' vince spesso."
+        )
+
+    return (
+        "NESSUN MIGLIORAMENTO chiaro rispetto ai parametri attuali in questo periodo: il "
+        "rendimento non supera quello attuale. I parametri attuali restano la scelta piu' "
+        "difendibile per ora."
+    )
+
+
 def run():
     data = fetch_candles(COINS, BACKTEST_DAYS, None)
 
@@ -584,7 +625,7 @@ def run():
     log(f"BACKTEST | coin {','.join(closes)} | {days:.0f} giorni | {len(times)} candele 1h | capitale ${args.capital:.2f}")
 
     # ========================================================
-    # 1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT
+    # 0) PARAMETRI ATTUALI DEL BOT (baseline di confronto)
     # ========================================================
     current_result = simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args)
     current_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args)
@@ -601,86 +642,59 @@ def run():
     print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {CURRENT_TP_PERCENT:.1f}%)", current_result, args, closes, days)
 
     # ========================================================
-    # 2) ANALISI ESPLORATIVA DEL DIP (TP fisso a quello attuale)
+    # 1) TROVA IL DIP MIGLIORE (TP tenuto fisso a quello attuale)
     # ========================================================
     dip_candidates = build_dip_grid(closes, highs)
-    print(f"\nANALISI ESPLORATIVA DEL DIP (non applicata al bot, TP fisso {CURRENT_TP_PERCENT:.1f}%) | griglia: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
+    print(f"\nSTEP 1/2 — RICERCA DIP (TP fisso {CURRENT_TP_PERCENT:.1f}%) | griglia: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
 
     dip_results = [simulate(times, closes, highs, BUY_USD, d, CURRENT_TP_PERCENT, interval, args) for d in dip_candidates]
     sim_dip = lambda t, c, h, v: simulate(t, c, h, BUY_USD, v, CURRENT_TP_PERCENT, interval, args)
 
     robust_dip, _ = find_robust_param("DIP", times, closes, highs, dip_candidates, interval, days, sim_dip, dip_results)
 
-    dip_summary = None
-
-    if robust_dip != CURRENT_DIP_PERCENT:
-        robust_dip_result = next(r for r in dip_results if r["dip"] == robust_dip)
-        robust_dip_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, CURRENT_TP_PERCENT, interval, args)
-
-        print(f"{'-' * 60}")
-        print(f"CONFRONTO DIP: attuale {CURRENT_DIP_PERCENT:.1f}% vs piu' frequente {robust_dip:.1f}%")
-        print(f"{'-' * 60}")
-        print(f"{'':25} {'attuale':>15} {'piu'' frequente':>18}")
-        print(f"{'DIP':<25} {CURRENT_DIP_PERCENT:>14.1f}% {robust_dip:>17.1f}%")
-        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_dip_result['ret']:>17.2f}%")
-        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_dip_result['missed_buys']:>18}")
-        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_dip_required:>17.2f}")
-        print(f"{'-' * 60}\n", flush=True)
-
-        dip_summary = (robust_dip, robust_dip_result["ret"], robust_dip_result["missed_buys"], robust_dip_required)
-    else:
-        log(f"Il DIP attuale ({CURRENT_DIP_PERCENT:.1f}%) coincide con quello piu' frequente trovato.")
-
     # ========================================================
-    # 3) ANALISI ESPLORATIVA DEL TP (DIP fisso a quello attuale)
+    # 2) SUL DIP TROVATO, CERCA IL TP MIGLIORE (non su quello attuale:
+    #    i due parametri vengono incrociati in cascata, non in isolamento)
     # ========================================================
     tp_candidates = build_tp_grid(closes)
-    print(f"\nANALISI ESPLORATIVA DEL TP (non applicata al bot, DIP fisso {CURRENT_DIP_PERCENT:.1f}%) | griglia: {', '.join(f'{t:.1f}%' for t in tp_candidates)}")
+    print(f"\nSTEP 2/2 — RICERCA TP (DIP fisso al valore trovato sopra, {robust_dip:.1f}%) | griglia: {', '.join(f'{t:.1f}%' for t in tp_candidates)}")
 
-    tp_results = [simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, t, interval, args) for t in tp_candidates]
-    sim_tp = lambda t, c, h, v: simulate(t, c, h, BUY_USD, CURRENT_DIP_PERCENT, v, interval, args)
+    tp_results = [simulate(times, closes, highs, BUY_USD, robust_dip, t, interval, args) for t in tp_candidates]
+    sim_tp = lambda t, c, h, v: simulate(t, c, h, BUY_USD, robust_dip, v, interval, args)
 
     robust_tp, _ = find_robust_param("TP", times, closes, highs, tp_candidates, interval, days, sim_tp, tp_results)
 
-    tp_summary = None
+    # ========================================================
+    # 3) SCENARIO COMBINATO: DIP e TP trovati insieme, confrontati in
+    #    blocco con i parametri attuali (non un parametro alla volta)
+    # ========================================================
+    combined_result = simulate(times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args)
+    combined_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args)
 
-    if robust_tp != CURRENT_TP_PERCENT:
-        robust_tp_result = next(r for r in tp_results if r["tp"] == robust_tp)
-        robust_tp_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, robust_tp, interval, args)
+    print(f"\n{'=' * 60}")
+    print(f"SCENARIO COMBINATO: DIP {robust_dip:.1f}% + TP {robust_tp:.1f}% (trovati in cascata)")
+    print(f"{'=' * 60}")
+    print(f"{'':25} {'attuale':>15} {'combinato':>15}")
+    print(f"{'DIP / TP':<25} {CURRENT_DIP_PERCENT:>6.1f}/{CURRENT_TP_PERCENT:<6.1f}% {robust_dip:>6.1f}/{robust_tp:<6.1f}%")
+    print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {combined_result['ret']:>14.2f}%")
+    print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {combined_result['missed_buys']:>15}")
+    print(f"{'Max drawdown':<25} {current_result['dd']:>14.2f}% {combined_result['dd']:>14.2f}%")
+    print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${combined_required:>14.2f}")
+    print(f"{'=' * 60}")
 
-        print(f"{'-' * 60}")
-        print(f"CONFRONTO TP: attuale {CURRENT_TP_PERCENT:.1f}% vs piu' frequente {robust_tp:.1f}%")
-        print(f"{'-' * 60}")
-        print(f"{'':25} {'attuale':>15} {'piu'' frequente':>18}")
-        print(f"{'TP':<25} {CURRENT_TP_PERCENT:>14.1f}% {robust_tp:>17.1f}%")
-        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_tp_result['ret']:>17.2f}%")
-        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_tp_result['missed_buys']:>18}")
-        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_tp_required:>17.2f}")
-        print(f"{'-' * 60}\n", flush=True)
+    verdict = verdict_text(current_result, combined_result, current_required, combined_required)
 
-        tp_summary = (robust_tp, robust_tp_result["ret"], robust_tp_result["missed_buys"], robust_tp_required)
-    else:
-        log(f"Il TP attuale ({CURRENT_TP_PERCENT:.1f}%) coincide con quello piu' frequente trovato.")
+    print(f"\nINDICAZIONE SULLA STRATEGIA:\n{verdict}\n", flush=True)
 
     # ========================================================
     # RIEPILOGO TELEGRAM
     # ========================================================
     lines = [
         f"\U0001F4CA Backtest {days:.0f}gg | capitale ${args.capital:.2f}",
-        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}% -> rend. {current_result['ret']:+.2f}%, saltati {current_result['missed_buys']}, capitale nec. ${current_required:.2f}",
+        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> rend. {current_result['ret']:+.2f}%, saltati {current_result['missed_buys']}, capitale nec. ${current_required:.2f}",
+        f"Combinato: DIP {robust_dip:.1f}%/TP {robust_tp:.1f}% -> rend. {combined_result['ret']:+.2f}%, saltati {combined_result['missed_buys']}, capitale nec. ${combined_required:.2f}",
+        f"\U0001F449 {verdict}",
     ]
-
-    if dip_summary:
-        v, ret, missed, req = dip_summary
-        lines.append(f"DIP piu' frequente: {v:.1f}% -> rend. {ret:+.2f}%, saltati {missed}, capitale nec. ${req:.2f}")
-    else:
-        lines.append("DIP attuale = DIP piu' frequente trovato")
-
-    if tp_summary:
-        v, ret, missed, req = tp_summary
-        lines.append(f"TP piu' frequente: {v:.1f}% -> rend. {ret:+.2f}%, saltati {missed}, capitale nec. ${req:.2f}")
-    else:
-        lines.append("TP attuale = TP piu' frequente trovato")
 
     send_telegram("\n".join(lines))
 
