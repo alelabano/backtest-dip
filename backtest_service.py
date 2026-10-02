@@ -52,46 +52,110 @@ HOUR_MS = 3600 * 1000
 # DATI E SIMULAZIONE
 # ============================================================
 
-def fetch_candles(coins, days, cache=None):
-    if cache and os.path.exists(cache):
-        with open(cache) as f:
-            data = json.load(f)
-        if set(coins) <= set(data):
-            return {c: data[c] for c in coins}
+def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
+    """
+    Primo avvio:
+        scarica l'intero periodo di BACKTEST_DAYS.
 
+    Cicli successivi:
+        scarica solo le ultime UPDATE_HOURS ore e fa merge per timestamp,
+        sostituendo anche la candela ancora in formazione.
+    """
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
-    info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    meta = info.spot_meta()
+    if info is None:
+        info = Info(constants.MAINNET_API_URL, skip_ws=True)
 
-    usdc = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
+    if meta is None:
+        meta = info.spot_meta()
+
+    usdc = next(
+        i for i, t in enumerate(meta["tokens"])
+        if t["name"] == "USDC"
+    )
 
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = end_ms - days * 24 * HOUR_MS
+    full_start_ms = end_ms - days * 24 * HOUR_MS
+
+    # Aggiorniamo una finestra sufficientemente ampia da comprendere
+    # la candela corrente e quelle eventualmente mancanti dall'ultimo ciclo.
+    UPDATE_HOURS = 6
+    incremental_start_ms = end_ms - UPDATE_HOURS * HOUR_MS
 
     data = {}
+    if existing_data:
+        data = {
+            c: list(existing_data[c])
+            for c in coins
+            if c in existing_data
+        }
 
     for coin in coins:
         market = None
 
         for idx, token in enumerate(meta["tokens"]):
             if token["name"] in (coin, "U" + coin):
-                market = next((m["name"] for m in meta["universe"] if m["tokens"] == [idx, usdc]), None)
-
+                market = next(
+                    (
+                        m["name"]
+                        for m in meta["universe"]
+                        if m["tokens"] == [idx, usdc]
+                    ),
+                    None,
+                )
                 if market:
                     break
 
         if not market:
-            print(f"ATTENZIONE: nessun mercato spot {coin}/USDC: coin ignorata")
+            print(
+                f"ATTENZIONE: nessun mercato spot {coin}/USDC: coin ignorata"
+            )
             continue
 
-        candles = info.candles_snapshot(market, "1h", start_ms, end_ms)
-        data[coin] = [{"t": c["t"], "h": float(c["h"]), "c": float(c["c"])} for c in candles]
+        # Se abbiamo già dati locali, aggiorniamo solo le ultime ore.
+        # Al primo avvio scarichiamo tutto il periodo.
+        if coin in data and data[coin]:
+            start_ms = incremental_start_ms
+        else:
+            start_ms = full_start_ms
 
-    if cache:
-        with open(cache, "w") as f:
-            json.dump(data, f)
+        candles = info.candles_snapshot(
+            market,
+            "1h",
+            start_ms,
+            end_ms,
+        )
+
+        new_candles = [
+            {
+                "t": c["t"],
+                "h": float(c["h"]),
+                "c": float(c["c"]),
+            }
+            for c in candles
+        ]
+
+        if coin not in data:
+            data[coin] = new_candles
+            continue
+
+        # Merge per timestamp.
+        # Le nuove candele sostituiscono quelle già presenti,
+        # indispensabile per aggiornare la candela 1h ancora aperta.
+        merged = {c["t"]: c for c in data[coin]}
+
+        for candle in new_candles:
+            merged[candle["t"]] = candle
+
+        # Mantieni sempre soltanto la finestra mobile di BACKTEST_DAYS.
+        cutoff_ms = end_ms - days * 24 * HOUR_MS
+
+        data[coin] = [
+            candle
+            for candle in sorted(merged.values(), key=lambda x: x["t"])
+            if candle["t"] >= cutoff_ms
+        ]
 
     return data
 
@@ -594,8 +658,36 @@ def verdict_text(current, combined, current_required, combined_required):
     )
 
 
+# Cache in memoria del servizio Railway.
+# Il primo ciclo scarica 200 giorni; i successivi aggiornano solo le ultime ore.
+DATA_CACHE = None
+INFO_CACHE = None
+META_CACHE = None
+
+
 def run():
-    data = fetch_candles(COINS, BACKTEST_DAYS, None)
+    global DATA_CACHE, INFO_CACHE, META_CACHE
+
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+
+    # Riutilizza la stessa connessione HTTP/client e gli stessi metadata
+    # per tutta la vita del processo.
+    if INFO_CACHE is None:
+        INFO_CACHE = Info(constants.MAINNET_API_URL, skip_ws=True)
+
+    if META_CACHE is None:
+        META_CACHE = INFO_CACHE.spot_meta()
+
+    DATA_CACHE = fetch_candles(
+        COINS,
+        BACKTEST_DAYS,
+        existing_data=DATA_CACHE,
+        info=INFO_CACHE,
+        meta=META_CACHE,
+    )
+
+    data = DATA_CACHE
 
     if not data:
         raise RuntimeError("Nessun dato scaricato")
