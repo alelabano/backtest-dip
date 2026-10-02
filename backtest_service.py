@@ -1,21 +1,27 @@
 """
 Servizio backtest per Railway. Ogni LOOP_INTERVAL_SECONDS (default 4 ore) fa
-due cose distinte:
+tre cose distinte:
 
 1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT: simula il bot con i
    parametri realmente in uso (DIP_PERCENT e TAKE_PROFIT_PERCENT letti
    dall'ambiente, gli stessi del bot vero) sugli ultimi BACKTEST_DAYS giorni,
    e calcola quanto capitale servirebbe per non saltare nessun BUY.
 
-2) ANALISI ESPLORATIVA DEL DIP: SOLO INFORMATIVA, non cambia il bot. Prova
-   una griglia di valori di DIP_PERCENT costruita sui ribassi realmente
-   osservati nei dati (percentili della distribuzione, non una lista
-   fissa), e sceglie quello che vince piu' spesso su finestre piu' corte
-   dentro il periodo (non quello col rendimento massimo sul periodo intero,
-   che premia facilmente un singolo caso isolato). Un pareggio tra valori
-   lontani tra loro (es. l'estremo piu' basso e quello piu' alto) e' un
-   segnale di periodi con regimi diversi, non va risolto in silenzio: viene
-   segnalato esplicitamente.
+2) ANALISI ESPLORATIVA DI DIP E TP: SOLO INFORMATIVA, non cambia il bot.
+   Per ciascuno dei due parametri, prova una griglia di valori costruita sui
+   movimenti di prezzo realmente osservati nei dati (percentili della
+   distribuzione, non una lista fissa), e sceglie quello che vince piu'
+   spesso su finestre piu' corte dentro il periodo (non quello col
+   rendimento massimo sul periodo intero, che premia facilmente un singolo
+   caso isolato). Un pareggio tra valori lontani tra loro e' un segnale di
+   periodi con regimi diversi, non va risolto in silenzio: viene segnalato
+   esplicitamente. L'analisi del TP tiene il DIP fisso a quello attuale, e
+   viceversa: i due parametri non vengono cercati insieme per tenere il
+   numero di simulazioni gestibile e il risultato leggibile.
+
+3) RIEPILOGO SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
+   impostate, invia un messaggio breve con i numeri principali. Il log
+   completo resta solo nei log di Railway.
 
 Include il calcolo del capitale reale (USDC + coin gestite + coin extra) e
 la gestione dei BUY saltati per fondi insufficienti.
@@ -24,7 +30,8 @@ Nota sul TP: con BUY_USD basso e SELL_PERCENT=95, il 95% di un lotto vale
 meno del minimo d'ordine finche' il prezzo non e' salito di circa
 100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95). Un
 TAKE_PROFIT_PERCENT sotto quella soglia non ha alcun effetto: il lotto resta
-scartato dal controllo sul minimo d'ordine indipendentemente dal target.
+scartato dal controllo sul minimo d'ordine indipendentemente dal target. La
+griglia del TP parte sempre da sopra questa soglia.
 """
 
 import json
@@ -35,6 +42,7 @@ import traceback
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import requests
 from dotenv import load_dotenv
 
 HOUR_MS = 3600 * 1000
@@ -273,13 +281,16 @@ BUY_USD = float(os.getenv("BUY_USD", "10"))
 # Parametri REALMENTE in uso sul bot: per il confronto "capitale necessario
 # per i parametri attuali", tienili identici a quelli del servizio bot.
 CURRENT_DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2.0"))
-TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4.0"))
+CURRENT_TP_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4.0"))
+
+SELL_PERCENT = float(os.getenv("SELL_PERCENT", "95"))
+MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
 
 # L'API restituisce al massimo ~5000 candele 1h, circa 208 giorni
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Analisi esplorativa del DIP per frequenza di vittoria su finestre
-# sovrapposte dentro il periodo (solo informativa, non applicata al bot)
+# Analisi esplorativa per frequenza di vittoria su finestre sovrapposte
+# dentro il periodo (solo informativa, non applicata al bot)
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
 STEP_DAYS = int(os.getenv("STEP_DAYS", "10"))
 GRID_SIZE = int(os.getenv("GRID_SIZE", "8"))
@@ -298,12 +309,15 @@ ACCOUNT_ADDRESS = (
 # nella simulazione di acquisto/vendita.
 CAPITAL_EXTRA_COINS = [c.strip().upper() for c in os.getenv("CAPITAL_EXTRA_COINS", "").split(",") if c.strip()]
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 args = SimpleNamespace(
     capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
-    sell_percent=float(os.getenv("SELL_PERCENT", "95")),
+    sell_percent=SELL_PERCENT,
     max_position=float(os.getenv("MAX_POSITION_USD", "200")),
     weekly_buys=int(os.getenv("MAX_WEEKLY_BUYS", "10")),
-    min_order=float(os.getenv("MIN_ORDER_USD", "10")),
+    min_order=MIN_ORDER_USD,
     fee=float(os.getenv("BACKTEST_FEE", "0.0007")),
     slippage=float(os.getenv("BACKTEST_SLIPPAGE", "0.0005")),
 )
@@ -312,6 +326,20 @@ args = SimpleNamespace(
 def log(message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     print(f"[{now}] {message}", flush=True)
+
+
+def send_telegram(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=10
+        )
+    except Exception as e:
+        log(f"TELEGRAM ERRORE | {e}")
 
 
 def get_real_capital(coins, last_prices):
@@ -384,13 +412,42 @@ def get_real_capital(coins, last_prices):
     return usdc_balance + coins_value + extra_value
 
 
+def _percentile_grid(values, floor=0.0):
+    # Griglia adattiva: percentili della distribuzione di valori osservati
+    # (ribassi per il DIP, rialzi per il TP), non una lista fissa. Solo la
+    # "coda" alta della distribuzione rappresenta movimenti degni di nota
+    # (la maggior parte del tempo il prezzo e' vicino al suo estremo
+    # recente, quindi i percentili bassi darebbero soglie vicine a 0).
+    if not values:
+        return [max(floor, x) for x in [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]][:GRID_SIZE]
+
+    values = sorted(values)
+    n = len(values)
+
+    percentiles = [round(40 + i * (98.5 - 40) / (GRID_SIZE - 1), 1) for i in range(GRID_SIZE)]
+
+    grid = []
+
+    for p in percentiles:
+        idx = min(int(n * p / 100), n - 1)
+        grid.append(round(values[idx] * 2) / 2)  # arrotonda a 0.5
+
+    seen = set()
+    out = []
+
+    for v in grid:
+        v = max(floor, v)
+
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    return sorted(out)
+
+
 def build_dip_grid(closes, highs):
-    # Griglia adattiva: percentili della distribuzione dei ribassi REALMENTE
-    # osservati nei dati (rispetto al massimo mobile a 24h), non una lista
-    # fissa. Cosi' la griglia si adatta alla volativa' effettiva delle coin
-    # configurate in questo periodo, invece di provare valori arbitrari che
-    # potrebbero essere tutti troppo bassi (coin poco volatili) o tutti
-    # troppo alti (coin molto volatili).
+    # Ribassi osservati rispetto al massimo mobile a 24h (stesso calcolo
+    # usato dal bot per il riferimento del primo lotto di ogni coin).
     drops = []
 
     for c, cl in closes.items():
@@ -405,43 +462,43 @@ def build_dip_grid(closes, highs):
                 if d > 0:
                     drops.append(d)
 
-    if not drops:
-        return [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
-
-    drops.sort()
-
-    n = len(drops)
-    # Percentili alti: solo la "coda" della distribuzione rappresenta ribassi
-    # degni di nota: la maggior parte del tempo il prezzo e' vicino al suo
-    # massimo a 24h, quindi i percentili bassi darebbero soglie vicine a 0.
-    percentiles = [40, 52, 64, 74, 83, 90, 95, 98.5][:GRID_SIZE] if GRID_SIZE < 8 else \
-        [round(40 + i * (98.5 - 40) / (GRID_SIZE - 1), 1) for i in range(GRID_SIZE)]
-
-    grid = []
-
-    for p in percentiles:
-        idx = min(int(n * p / 100), n - 1)
-        grid.append(round(drops[idx] * 2) / 2)  # arrotonda a 0.5
-
-    # dedup mantenendo l'ordine, e garantisce almeno 0.5% come minimo
-    seen = set()
-    out = []
-
-    for v in grid:
-        v = max(0.5, v)
-
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-
-    return sorted(out)
+    return _percentile_grid(drops, floor=0.5)
 
 
-def find_robust_dip(times, closes, highs, dip_candidates, interval, days, results):
+def build_tp_grid(closes):
+    # Rialzi osservati rispetto al minimo mobile a 24h: stessa idea del
+    # calcolo del DIP, ma capovolta (quanto il prezzo e' salito dal suo
+    # minimo recente), per stimare l'ampiezza tipica dei movimenti verso
+    # l'alto in questi dati. La soglia minima e' vincolata dal minimo
+    # d'ordine: con SELL_PERCENT < 100, un TP sotto circa
+    # (100/SELL_PERCENT*100 - 100)% non ha alcun effetto (vedi nota in testa
+    # al file), quindi la griglia non propone mai valori sotto quella soglia.
+    rises = []
+
+    for c, cl in closes.items():
+        for i in range(23, len(cl)):
+            low24 = min(cl[i - 23:i + 1])
+
+            if low24 > 0:
+                r = (cl[i] - low24) / low24 * 100
+
+                if r > 0:
+                    rises.append(r)
+
+    effective_floor = (100 / SELL_PERCENT * 100 - 100) if SELL_PERCENT < 100 else 0.0
+    floor = max(0.5, round((effective_floor + 0.3) * 2) / 2)  # un po' sopra la soglia, non esattamente sul confine
+
+    return _percentile_grid(rises, floor=floor)
+
+
+def find_robust_param(label, times, closes, highs, candidates, interval, days, sim_fn, results):
+    # Generico: usato sia per il DIP che per il TP. sim_fn(times, closes,
+    # highs, value) deve restituire il risultato di simulate() per quel
+    # valore del parametro in esame, con l'altro parametro tenuto fisso.
     window_candles = int(WINDOW_DAYS * 24)
     step_candles = max(1, int(STEP_DAYS * 24))
 
-    wins = {d: 0 for d in dip_candidates}
+    wins = {v: 0 for v in candidates}
     windows_tested = 0
 
     start = 23
@@ -453,47 +510,47 @@ def find_robust_dip(times, closes, highs, dip_candidates, interval, days, result
         w_closes = {c: v[start:end] for c, v in closes.items()}
         w_highs = {c: v[start:end] for c, v in highs.items()}
 
-        best_dip, best_ret = None, None
+        best_v, best_ret = None, None
 
-        for dip in dip_candidates:
-            r = simulate(w_times, w_closes, w_highs, BUY_USD, dip, TAKE_PROFIT_PERCENT, interval, args)
+        for v in candidates:
+            r = sim_fn(w_times, w_closes, w_highs, v)
 
             if best_ret is None or r["ret"] > best_ret:
-                best_dip, best_ret = dip, r["ret"]
+                best_v, best_ret = v, r["ret"]
 
-        wins[best_dip] += 1
+        wins[best_v] += 1
         windows_tested += 1
         start += step_candles
 
-    print(f"\nFREQUENZA VITTORIE SU {windows_tested} FINESTRE DA {WINDOW_DAYS}gg (passo {STEP_DAYS}gg)")
+    print(f"\nFREQUENZA VITTORIE {label} SU {windows_tested} FINESTRE DA {WINDOW_DAYS}gg (passo {STEP_DAYS}gg)")
     print("-" * 40)
 
-    for d in dip_candidates:
-        pct = wins[d] / windows_tested * 100 if windows_tested else 0
+    for v in candidates:
+        pct = wins[v] / windows_tested * 100 if windows_tested else 0
         bar = "#" * round(pct / 5)
-        print(f"DIP {d:>5.1f}% | {wins[d]:>2} vittorie ({pct:>4.0f}%) {bar}")
+        print(f"{label} {v:>5.1f}% | {wins[v]:>2} vittorie ({pct:>4.0f}%) {bar}")
 
     if windows_tested == 0:
-        log(f"RICERCA DIP | periodo troppo corto per finestre da {WINDOW_DAYS}gg")
-        return dip_candidates[0], wins
+        log(f"RICERCA {label} | periodo troppo corto per finestre da {WINDOW_DAYS}gg")
+        return candidates[0], wins
 
     max_wins = max(wins.values())
-    tied = [d for d in dip_candidates if wins[d] == max_wins]
+    tied = [v for v in candidates if wins[v] == max_wins]
     tied_pct = max_wins / windows_tested * 100
 
     if len(tied) == 1:
-        robust_dip = tied[0]
-        print(f"\n-> DIP PIU' FREQUENTE: {robust_dip:.1f}% (vince nel {tied_pct:.0f}% delle finestre)\n")
+        robust_v = tied[0]
+        print(f"\n-> {label} PIU' FREQUENTE: {robust_v:.1f}% (vince nel {tied_pct:.0f}% delle finestre)\n")
     else:
-        by_ret = {r["dip"]: r["ret"] for r in results}
-        robust_dip = max(tied, key=lambda d: by_ret.get(d, float("-inf")))
-        tied_str = ", ".join(f"{d:.1f}%" for d in tied)
+        by_ret = {r[label.lower()]: r["ret"] for r in results}
+        robust_v = max(tied, key=lambda v: by_ret.get(v, float("-inf")))
+        tied_str = ", ".join(f"{v:.1f}%" for v in tied)
 
-        print(f"\n-> PAREGGIO nel {tied_pct:.0f}% delle finestre tra: {tied_str}")
-        print("   Nessun DIP e' chiaramente piu' frequente: questo periodo ha probabilmente regimi diversi.")
-        print(f"   Scelto {robust_dip:.1f}% come criterio secondario (rendimento piu' alto sul periodo intero tra i pareggiati).\n")
+        print(f"\n-> PAREGGIO {label} nel {tied_pct:.0f}% delle finestre tra: {tied_str}")
+        print("   Nessun valore e' chiaramente piu' frequente: questo periodo ha probabilmente regimi diversi.")
+        print(f"   Scelto {robust_v:.1f}% come criterio secondario (rendimento piu' alto sul periodo intero tra i pareggiati).\n")
 
-    return robust_dip, wins
+    return robust_v, wins
 
 
 def run():
@@ -529,11 +586,11 @@ def run():
     # ========================================================
     # 1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT
     # ========================================================
-    current_result = simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args)
-    current_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, TAKE_PROFIT_PERCENT, interval, args)
+    current_result = simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args)
+    current_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args)
 
     print(f"\n{'#' * 60}")
-    print(f"# PARAMETRI ATTUALI DEL BOT: DIP {CURRENT_DIP_PERCENT:.1f}% | TP {TAKE_PROFIT_PERCENT:.1f}%")
+    print(f"# PARAMETRI ATTUALI DEL BOT: DIP {CURRENT_DIP_PERCENT:.1f}% | TP {CURRENT_TP_PERCENT:.1f}%")
     print(f"{'#' * 60}")
     print(f"Capitale attuale:    ${args.capital:>10.2f}")
     print(f"BUY saltati (200gg): {current_result['missed_buys']:>10}")
@@ -541,34 +598,91 @@ def run():
     print(f"  (mancano ${max(0.0, current_required - args.capital):.2f})" if current_required > args.capital else "  (sufficiente)")
     print(f"{'#' * 60}\n", flush=True)
 
-    print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {TAKE_PROFIT_PERCENT:.1f}%)", current_result, args, closes, days)
+    print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {CURRENT_TP_PERCENT:.1f}%)", current_result, args, closes, days)
 
     # ========================================================
-    # 2) ANALISI ESPLORATIVA DEL DIP (solo informativa)
+    # 2) ANALISI ESPLORATIVA DEL DIP (TP fisso a quello attuale)
     # ========================================================
     dip_candidates = build_dip_grid(closes, highs)
+    print(f"\nANALISI ESPLORATIVA DEL DIP (non applicata al bot, TP fisso {CURRENT_TP_PERCENT:.1f}%) | griglia: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
 
-    print(f"\nANALISI ESPLORATIVA DEL DIP (non applicata al bot) | griglia adattata ai dati: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
+    dip_results = [simulate(times, closes, highs, BUY_USD, d, CURRENT_TP_PERCENT, interval, args) for d in dip_candidates]
+    sim_dip = lambda t, c, h, v: simulate(t, c, h, BUY_USD, v, CURRENT_TP_PERCENT, interval, args)
 
-    results = [simulate(times, closes, highs, BUY_USD, dip, TAKE_PROFIT_PERCENT, interval, args) for dip in dip_candidates]
+    robust_dip, _ = find_robust_param("DIP", times, closes, highs, dip_candidates, interval, days, sim_dip, dip_results)
 
-    robust_dip, _wins = find_robust_dip(times, closes, highs, dip_candidates, interval, days, results)
+    dip_summary = None
 
     if robust_dip != CURRENT_DIP_PERCENT:
-        robust_result = next(r for r in results if r["dip"] == robust_dip)
-        robust_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, TAKE_PROFIT_PERCENT, interval, args)
+        robust_dip_result = next(r for r in dip_results if r["dip"] == robust_dip)
+        robust_dip_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, CURRENT_TP_PERCENT, interval, args)
 
         print(f"{'-' * 60}")
-        print(f"CONFRONTO: parametri attuali (DIP {CURRENT_DIP_PERCENT:.1f}%) vs DIP piu' frequente (DIP {robust_dip:.1f}%)")
+        print(f"CONFRONTO DIP: attuale {CURRENT_DIP_PERCENT:.1f}% vs piu' frequente {robust_dip:.1f}%")
         print(f"{'-' * 60}")
         print(f"{'':25} {'attuale':>15} {'piu'' frequente':>18}")
         print(f"{'DIP':<25} {CURRENT_DIP_PERCENT:>14.1f}% {robust_dip:>17.1f}%")
-        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_result['ret']:>17.2f}%")
-        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_result['missed_buys']:>18}")
-        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_required:>17.2f}")
+        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_dip_result['ret']:>17.2f}%")
+        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_dip_result['missed_buys']:>18}")
+        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_dip_required:>17.2f}")
         print(f"{'-' * 60}\n", flush=True)
+
+        dip_summary = (robust_dip, robust_dip_result["ret"], robust_dip_result["missed_buys"], robust_dip_required)
     else:
-        log(f"Il DIP attuale ({CURRENT_DIP_PERCENT:.1f}%) coincide con quello piu' frequente trovato nell'analisi esplorativa.")
+        log(f"Il DIP attuale ({CURRENT_DIP_PERCENT:.1f}%) coincide con quello piu' frequente trovato.")
+
+    # ========================================================
+    # 3) ANALISI ESPLORATIVA DEL TP (DIP fisso a quello attuale)
+    # ========================================================
+    tp_candidates = build_tp_grid(closes)
+    print(f"\nANALISI ESPLORATIVA DEL TP (non applicata al bot, DIP fisso {CURRENT_DIP_PERCENT:.1f}%) | griglia: {', '.join(f'{t:.1f}%' for t in tp_candidates)}")
+
+    tp_results = [simulate(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, t, interval, args) for t in tp_candidates]
+    sim_tp = lambda t, c, h, v: simulate(t, c, h, BUY_USD, CURRENT_DIP_PERCENT, v, interval, args)
+
+    robust_tp, _ = find_robust_param("TP", times, closes, highs, tp_candidates, interval, days, sim_tp, tp_results)
+
+    tp_summary = None
+
+    if robust_tp != CURRENT_TP_PERCENT:
+        robust_tp_result = next(r for r in tp_results if r["tp"] == robust_tp)
+        robust_tp_required = capital_needed(times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, robust_tp, interval, args)
+
+        print(f"{'-' * 60}")
+        print(f"CONFRONTO TP: attuale {CURRENT_TP_PERCENT:.1f}% vs piu' frequente {robust_tp:.1f}%")
+        print(f"{'-' * 60}")
+        print(f"{'':25} {'attuale':>15} {'piu'' frequente':>18}")
+        print(f"{'TP':<25} {CURRENT_TP_PERCENT:>14.1f}% {robust_tp:>17.1f}%")
+        print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {robust_tp_result['ret']:>17.2f}%")
+        print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {robust_tp_result['missed_buys']:>18}")
+        print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${robust_tp_required:>17.2f}")
+        print(f"{'-' * 60}\n", flush=True)
+
+        tp_summary = (robust_tp, robust_tp_result["ret"], robust_tp_result["missed_buys"], robust_tp_required)
+    else:
+        log(f"Il TP attuale ({CURRENT_TP_PERCENT:.1f}%) coincide con quello piu' frequente trovato.")
+
+    # ========================================================
+    # RIEPILOGO TELEGRAM
+    # ========================================================
+    lines = [
+        f"\U0001F4CA Backtest {days:.0f}gg | capitale ${args.capital:.2f}",
+        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}% -> rend. {current_result['ret']:+.2f}%, saltati {current_result['missed_buys']}, capitale nec. ${current_required:.2f}",
+    ]
+
+    if dip_summary:
+        v, ret, missed, req = dip_summary
+        lines.append(f"DIP piu' frequente: {v:.1f}% -> rend. {ret:+.2f}%, saltati {missed}, capitale nec. ${req:.2f}")
+    else:
+        lines.append("DIP attuale = DIP piu' frequente trovato")
+
+    if tp_summary:
+        v, ret, missed, req = tp_summary
+        lines.append(f"TP piu' frequente: {v:.1f}% -> rend. {ret:+.2f}%, saltati {missed}, capitale nec. ${req:.2f}")
+    else:
+        lines.append("TP attuale = TP piu' frequente trovato")
+
+    send_telegram("\n".join(lines))
 
 
 if __name__ == "__main__":
