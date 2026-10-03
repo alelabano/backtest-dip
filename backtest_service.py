@@ -10,21 +10,27 @@ tre cose distinte:
 2) ANALISI ESPLORATIVA DI DIP E TP: SOLO INFORMATIVA, non cambia il bot.
    Per ciascuno dei due parametri, prova una griglia di valori costruita sui
    movimenti di prezzo realmente osservati nei dati (percentili della
-   distribuzione, non una lista fissa), e sceglie quello che vince piu'
+   distribuzione, non una lista fissa). Prima trova il DIP che vince piu'
    spesso su finestre piu' corte dentro il periodo (non quello col
    rendimento massimo sul periodo intero, che premia facilmente un singolo
-   caso isolato). Un pareggio tra valori lontani tra loro e' un segnale di
+   caso isolato), poi usa QUEL DIP come base fissa per trovare il TP
+   migliore: i due parametri vengono incrociati in cascata, non cercati in
+   isolamento. Un pareggio tra valori lontani tra loro e' un segnale di
    periodi con regimi diversi, non va risolto in silenzio: viene segnalato
-   esplicitamente. L'analisi del TP tiene il DIP fisso a quello attuale, e
-   viceversa: i due parametri non vengono cercati insieme per tenere il
-   numero di simulazioni gestibile e il risultato leggibile.
+   esplicitamente. Lo scenario combinato (DIP+TP trovati insieme) viene
+   confrontato in blocco con i parametri attuali, con un giudizio testuale
+   esplicito che tiene conto di rendimento, BUY saltati e capitale
+   necessario insieme — non solo del rendimento.
 
 3) RIEPILOGO SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
-   impostate, invia un messaggio breve con i numeri principali. Il log
-   completo resta solo nei log di Railway.
+   impostate, invia un messaggio breve con i numeri principali e il
+   giudizio. Il log completo resta solo nei log di Railway.
 
-Include il calcolo del capitale reale (USDC + coin gestite + coin extra) e
-la gestione dei BUY saltati per fondi insufficienti.
+Include il calcolo del capitale reale (USDC + coin gestite + coin extra),
+la gestione dei BUY saltati per fondi insufficienti, cache dei dati e dei
+metadata per tutta la vita del processo (solo le ultime ore vengono
+riscaricate a ogni ciclo, non l'intero periodo), e retry con backoff sulle
+chiamate API in caso di rate limit (429).
 
 Nota sul TP: con BUY_USD basso e SELL_PERCENT=95, il 95% di un lotto vale
 meno del minimo d'ordine finche' il prezzo non e' salito di circa
@@ -49,6 +55,32 @@ HOUR_MS = 3600 * 1000
 
 
 # ============================================================
+# RETRY CON BACKOFF SULLE CHIAMATE API (rate limit 429)
+# ============================================================
+
+def _with_retry(fn, *args, attempts=4, base_delay=5, **kwargs):
+    # Un 429 e' quasi sempre transitorio (rate limit dell'API pubblica di
+    # Hyperliquid, non un errore nei dati o nel codice). Senza retry, un
+    # singolo 429 fa fallire l'intero ciclo e si aspetta LOOP_INTERVAL_SECONDS
+    # (di default 4 ore) prima di riprovare: con un backoff di pochi secondi
+    # si risolve quasi sempre subito.
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            rate_limited = status == 429 or "429" in str(e)
+
+            if rate_limited and attempt < attempts:
+                delay = base_delay * attempt
+                log(f"API RATE LIMIT (429) | tentativo {attempt}/{attempts}, riprovo in {delay}s")
+                time.sleep(delay)
+                continue
+
+            raise
+
+
+# ============================================================
 # DATI E SIMULAZIONE
 # ============================================================
 
@@ -68,7 +100,7 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
         info = Info(constants.MAINNET_API_URL, skip_ws=True)
 
     if meta is None:
-        meta = info.spot_meta()
+        meta = _with_retry(info.spot_meta)
 
     usdc = next(
         i for i, t in enumerate(meta["tokens"])
@@ -120,7 +152,8 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
         else:
             start_ms = full_start_ms
 
-        candles = info.candles_snapshot(
+        candles = _with_retry(
+            info.candles_snapshot,
             market,
             "1h",
             start_ms,
@@ -406,21 +439,18 @@ def send_telegram(message):
         log(f"TELEGRAM ERRORE | {e}")
 
 
-def get_real_capital(coins, last_prices):
+def get_real_capital(coins, last_prices, info, meta):
     # Saldo reale sul conto: USDC + valore delle coin gestite dal bot, al prezzo
     # di chiusura piu' recente (stesso dato del backtest, nessuna chiamata extra
     # all'orderbook), + valore delle coin extra (CAPITAL_EXTRA_COINS) al prezzo
     # spot corrente, per coin sul conto ma non gestite da questo bot (es. BTC).
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-
-    info = Info(constants.MAINNET_API_URL, skip_ws=True)
-    user_state = info.spot_user_state(ACCOUNT_ADDRESS)
+    # Riusa l'Info e i metadata gia' scaricati in run() (INFO_CACHE/META_CACHE):
+    # nessuna chiamata spot_meta() aggiuntiva a ogni ciclo.
+    user_state = _with_retry(info.spot_user_state, ACCOUNT_ADDRESS)
 
     extra_prices = {}
 
     if CAPITAL_EXTRA_COINS:
-        meta = info.spot_meta()
         usdc_idx = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
 
         for coin in CAPITAL_EXTRA_COINS:
@@ -436,7 +466,7 @@ def get_real_capital(coins, last_prices):
                         log(f"CAPITALE REALE | {coin}: token trovato ma nessun mercato spot {coin}/USDC")
                         break
 
-                    book = info.l2_snapshot(market)
+                    book = _with_retry(info.l2_snapshot, market)
                     levels = book.get("levels", [])
 
                     if len(levels) == 2 and levels[0] and levels[1]:
@@ -668,16 +698,19 @@ META_CACHE = None
 def run():
     global DATA_CACHE, INFO_CACHE, META_CACHE
 
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-
     # Riutilizza la stessa connessione HTTP/client e gli stessi metadata
-    # per tutta la vita del processo.
+    # per tutta la vita del processo: spot_meta() viene chiamata una sola
+    # volta in assoluto, non a ogni ciclo. L'import resta qui dentro, non
+    # in testa al file, cosi' avviene una sola volta (al primo ciclo) e
+    # non e' necessario quando la cache e' gia' popolata.
     if INFO_CACHE is None:
+        from hyperliquid.info import Info
+        from hyperliquid.utils import constants
+
         INFO_CACHE = Info(constants.MAINNET_API_URL, skip_ws=True)
 
     if META_CACHE is None:
-        META_CACHE = INFO_CACHE.spot_meta()
+        META_CACHE = _with_retry(INFO_CACHE.spot_meta)
 
     DATA_CACHE = fetch_candles(
         COINS,
@@ -703,7 +736,7 @@ def run():
     if ACCOUNT_ADDRESS:
         try:
             last_prices = {c: closes[c][-1] for c in closes}
-            real_capital = get_real_capital(closes, last_prices)
+            real_capital = get_real_capital(closes, last_prices, INFO_CACHE, META_CACHE)
 
             if real_capital > 0:
                 args.capital = real_capital
