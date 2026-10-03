@@ -657,15 +657,34 @@ def verdict_text(current, combined, current_required, combined_required):
     # risultato migliore sul periodo intero (un TP alto, per esempio, puo'
     # vincere spesso in finestre isolate e allo stesso tempo bloccare piu'
     # capitale sul periodo intero, con piu' BUY saltati).
+    # Tolleranza sul rendimento (punti percentuali): un rendimento di poco
+    # inferiore non scarta automaticamente lo scenario se il rischio e' molto
+    # piu' basso — un drawdown piu' contenuto e meno BUY saltati possono
+    # valere piu' di qualche punto percentuale di rendimento in meno,
+    # specialmente con poco capitale.
+    RET_TOLERANCE_PP = 5.0
+
     better_ret = combined["ret"] > current["ret"]
+    similar_ret = combined["ret"] >= current["ret"] - RET_TOLERANCE_PP
     not_worse_missed = combined["missed_buys"] <= current["missed_buys"]
     not_worse_capital = combined_required <= current_required
+    lower_risk = combined["dd"] < current["dd"]
 
     if better_ret and not_worse_missed and not_worse_capital:
         return (
             "MIGLIORAMENTO su tutti gli indicatori: rendimento piu' alto, BUY saltati non "
             "peggiori, capitale necessario non superiore. E' il caso piu' solido per valutare "
             "un cambio dei parametri, ma resta un risultato su un solo periodo passato."
+        )
+
+    if not better_ret and similar_ret and not_worse_missed and not_worse_capital and lower_risk:
+        return (
+            f"RENDIMENTO COMPARABILE CON RISCHIO MOLTO PIU' BASSO: {combined['ret']:+.2f}% contro "
+            f"{current['ret']:+.2f}% attuale (entro {RET_TOLERANCE_PP:.0f} punti), ma drawdown "
+            f"{combined['dd']:.2f}% contro {current['dd']:.2f}% e BUY saltati {combined['missed_buys']} "
+            f"contro {current['missed_buys']}. Con poco capitale questo profilo (meno rischio, capitale "
+            "quasi tutto utilizzabile) puo' valere piu' di qualche punto di rendimento in meno: "
+            "da valutare seriamente, non solo come alternativa minore."
         )
 
     if better_ret and (not not_worse_missed or not not_worse_capital):
