@@ -42,9 +42,11 @@ griglia del TP parte sempre da sopra questa soglia.
 
 import json
 import os
+import statistics
 import sys
 import time
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -694,6 +696,60 @@ DATA_CACHE = None
 INFO_CACHE = None
 META_CACHE = None
 
+# Storico dei valori "piu' frequenti" trovati a ogni ciclo, per DIP e TP.
+# Vive solo in memoria per la vita del processo: si azzera a ogni redeploy
+# o riavvio di Railway (il servizio non ha un Volume). Serve a distinguere
+# un valore che emerge in modo ricorrente da uno che cambia a ogni ciclo.
+DIP_HISTORY = []
+TP_HISTORY = []
+
+# Quante storie tenere al massimo (evita crescita illimitata in memoria).
+# Con LOOP_INTERVAL_SECONDS=4h, 200 cicli sono circa 33 giorni di storico.
+HISTORY_MAX = int(os.getenv("HISTORY_MAX", "200"))
+
+# Soglie per il giudizio di stabilita'
+STABILITY_MIN_SAMPLES = int(os.getenv("STABILITY_MIN_SAMPLES", "5"))
+STABILITY_BAND = float(os.getenv("STABILITY_BAND", "1.0"))  # punti percentuali
+
+
+def stability_report(label, history):
+    # Non basta guardare se un valore si ripete IDENTICO: con una griglia
+    # continua, 1.5% e 2.0% sono "vicini" anche se non coincidono mai
+    # esattamente. Quindi oltre alla moda (valore esatto piu' frequente) si
+    # conta anche quante osservazioni cadono entro STABILITY_BAND punti
+    # percentuali dalla moda, e si calcola la deviazione standard
+    # dell'intero storico come misura di dispersione complessiva.
+    n = len(history)
+
+    print(f"\nSTORICO {label} ({n} cicli in memoria, azzerato a ogni redeploy)")
+
+    if n < STABILITY_MIN_SAMPLES:
+        print(f"-> Servono almeno {STABILITY_MIN_SAMPLES} cicli per un giudizio di stabilita' (ne servono ancora {STABILITY_MIN_SAMPLES - n}).\n")
+        return f"{label}: solo {n}/{STABILITY_MIN_SAMPLES} cicli, ancora presto per giudicare"
+
+    mean = statistics.mean(history)
+    stdev = statistics.pstdev(history)
+
+    counts = Counter(history)
+    mode_value, mode_count = counts.most_common(1)[0]
+
+    near_mode = sum(1 for v in history if abs(v - mode_value) <= STABILITY_BAND)
+    near_pct = near_mode / n * 100
+
+    print(f"Media {mean:.2f}% | dev. standard {stdev:.2f}% | moda {mode_value:.1f}% (esatta in {mode_count}/{n} cicli)")
+    print(f"Entro ±{STABILITY_BAND:.1f}% dalla moda: {near_mode}/{n} cicli ({near_pct:.0f}%)")
+
+    if near_pct >= 60:
+        verdict = f"STABILE: {mode_value:.1f}% (o un valore entro ±{STABILITY_BAND:.1f}%) e' il risultato ricorrente nel {near_pct:.0f}% dei cicli osservati."
+    elif near_pct >= 40:
+        verdict = f"PARZIALMENTE STABILE: {mode_value:.1f}% ricorre nel {near_pct:.0f}% dei cicli, ma non e' ancora un pattern netto."
+    else:
+        verdict = f"INSTABILE: il valore trovato cambia spesso da un ciclo all'altro (dev. standard {stdev:.2f}%). Probabile rumore, non un pattern."
+
+    print(f"-> {verdict}\n", flush=True)
+
+    return f"{label} storico: {verdict}"
+
 
 def run():
     global DATA_CACHE, INFO_CACHE, META_CACHE
@@ -777,6 +833,10 @@ def run():
 
     robust_dip, _ = find_robust_param("DIP", times, closes, highs, dip_candidates, interval, days, sim_dip, dip_results)
 
+    DIP_HISTORY.append(robust_dip)
+    del DIP_HISTORY[:-HISTORY_MAX]  # tiene solo gli ultimi HISTORY_MAX cicli
+    dip_stability = stability_report("DIP", DIP_HISTORY)
+
     # ========================================================
     # 2) SUL DIP TROVATO, CERCA IL TP MIGLIORE (non su quello attuale:
     #    i due parametri vengono incrociati in cascata, non in isolamento)
@@ -788,6 +848,10 @@ def run():
     sim_tp = lambda t, c, h, v: simulate(t, c, h, BUY_USD, robust_dip, v, interval, args)
 
     robust_tp, _ = find_robust_param("TP", times, closes, highs, tp_candidates, interval, days, sim_tp, tp_results)
+
+    TP_HISTORY.append(robust_tp)
+    del TP_HISTORY[:-HISTORY_MAX]
+    tp_stability = stability_report("TP", TP_HISTORY)
 
     # ========================================================
     # 3) SCENARIO COMBINATO: DIP e TP trovati insieme, confrontati in
@@ -819,6 +883,8 @@ def run():
         f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> rend. {current_result['ret']:+.2f}%, saltati {current_result['missed_buys']}, capitale nec. ${current_required:.2f}",
         f"Combinato: DIP {robust_dip:.1f}%/TP {robust_tp:.1f}% -> rend. {combined_result['ret']:+.2f}%, saltati {combined_result['missed_buys']}, capitale nec. ${combined_required:.2f}",
         f"\U0001F449 {verdict}",
+        dip_stability,
+        tp_stability,
     ]
 
     send_telegram("\n".join(lines))
