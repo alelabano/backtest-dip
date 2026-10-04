@@ -7,20 +7,24 @@ tre cose distinte:
    dall'ambiente, gli stessi del bot vero) sugli ultimi BACKTEST_DAYS giorni,
    e calcola quanto capitale servirebbe per non saltare nessun BUY.
 
-2) ANALISI ESPLORATIVA DI DIP E TP: SOLO INFORMATIVA, non cambia il bot.
-   Per ciascuno dei due parametri, prova una griglia di valori costruita sui
-   movimenti di prezzo realmente osservati nei dati (percentili della
-   distribuzione, non una lista fissa). Prima trova il DIP che vince piu'
-   spesso su finestre piu' corte dentro il periodo (non quello col
-   rendimento massimo sul periodo intero, che premia facilmente un singolo
-   caso isolato), poi usa QUEL DIP come base fissa per trovare il TP
-   migliore: i due parametri vengono incrociati in cascata, non cercati in
-   isolamento. Un pareggio tra valori lontani tra loro e' un segnale di
-   periodi con regimi diversi, non va risolto in silenzio: viene segnalato
-   esplicitamente. Lo scenario combinato (DIP+TP trovati insieme) viene
-   confrontato in blocco con i parametri attuali, con un giudizio testuale
-   esplicito che tiene conto di rendimento, BUY saltati e capitale
-   necessario insieme — non solo del rendimento.
+2) ANALISI ESPLORATIVA DI DIP E TP SU OBIETTIVO MENSILE: SOLO INFORMATIVA,
+   non cambia il bot. Il periodo viene diviso in MESI DI CALENDARIO (non
+   finestre arbitrarie), e per ciascun DIP/TP candidato si calcola la
+   MEDIANA del profitto REALIZZATO per mese di calendario, su un'UNICA
+   simulazione continua sull'intero periodo (i lotti aperti in un mese
+   possono chiudersi nel mese successivo, come accade davvero al bot: non
+   si riparte da zero a ogni mese). Si sceglie il valore la cui mediana
+   mensile e' piu' vicina a TARGET_MONTHLY_PROFIT (default $30/mese), con
+   la deviazione standard tra i mesi come criterio secondario (un valore
+   costante mese per mese e' preferibile a uno che rende bene solo in un
+   mese fortunato). Prima si cerca il DIP migliore (TP fisso a quello
+   attuale), poi SU QUEL DIP si cerca il TP migliore: i due parametri
+   vengono incrociati in cascata, non cercati in isolamento. Il risultato
+   trovato viene confrontato con i parametri attuali con un giudizio
+   testuale esplicito (quattro casi: piu' vicino e piu' costante, piu'
+   vicino ma meno costante, piu' costante ma piu' lontano, nessun
+   vantaggio), che include anche BUY saltati e capitale necessario come
+   fattori di rischio secondari.
 
 3) RIEPILOGO SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
    impostate, invia un messaggio breve con i numeri principali e il
@@ -225,6 +229,7 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
     per = {c: {"buys": 0, "sells": 0, "realized": 0.0} for c in coins}
     missed_buys = 0
     min_cash = a.capital
+    monthly_realized = {}  # "YYYY-MM" -> profitto realizzato in quel mese di calendario
 
     for i in range(23, len(times), interval):
         px = {c: closes[c][i] for c in coins}
@@ -255,6 +260,10 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
             pnl = proceeds - qty * lot["cost"]
             realized += pnl
             per[lot["coin"]]["realized"] += pnl
+
+            month_key = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%Y-%m")
+            monthly_realized[month_key] = monthly_realized.get(month_key, 0.0) + pnl
+
             per[lot["coin"]]["sells"] += 1
             lot["qty"] -= qty
             sells += 1
@@ -331,6 +340,7 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
         "per": per,
         "missed_buys": missed_buys,
         "min_cash": min_cash,
+        "monthly_realized": monthly_realized,
     }
 
 
@@ -388,10 +398,11 @@ MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
 # L'API restituisce al massimo ~5000 candele 1h, circa 208 giorni
 BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
 
-# Analisi esplorativa per frequenza di vittoria su finestre sovrapposte
-# dentro il periodo (solo informativa, non applicata al bot)
-WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "30"))
-STEP_DAYS = int(os.getenv("STEP_DAYS", "10"))
+# Analisi esplorativa (solo informativa, non applicata al bot): cerca DIP e
+# TP la cui mediana di profitto REALIZZATO per mese di calendario sia piu'
+# vicina a questo obiettivo, non il valore che "vince piu' spesso" in
+# astratto.
+TARGET_MONTHLY_PROFIT = float(os.getenv("TARGET_MONTHLY_PROFIT", "30"))
 GRID_SIZE = int(os.getenv("GRID_SIZE", "8"))
 
 # Capitale iniziale del backtest = saldo reale del conto (USDC + coin gestite
@@ -587,126 +598,129 @@ def build_tp_grid(closes):
     return _percentile_grid(rises, floor=floor)
 
 
-def find_robust_param(label, times, closes, highs, candidates, interval, days, sim_fn, results):
-    # Generico: usato sia per il DIP che per il TP. sim_fn(times, closes,
-    # highs, value) deve restituire il risultato di simulate() per quel
-    # valore del parametro in esame, con l'altro parametro tenuto fisso.
-    window_candles = int(WINDOW_DAYS * 24)
-    step_candles = max(1, int(STEP_DAYS * 24))
+def calendar_months_in_range(times):
+    # Elenco ordinato di tutti i mesi di calendario (UTC) coperti dai dati,
+    # compresi quelli senza nessuna vendita (contano come $0 per quel mese,
+    # non vengono ignorati: un parametro che non vende per mesi deve
+    # risultare peggiore, non uscire dal conteggio).
+    first = datetime.fromtimestamp(times[0] / 1000, timezone.utc)
+    last = datetime.fromtimestamp(times[-1] / 1000, timezone.utc)
 
-    wins = {v: 0 for v in candidates}
-    windows_tested = 0
+    months = []
+    y, m = first.year, first.month
 
-    start = 23
+    while (y, m) <= (last.year, last.month):
+        months.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
 
-    while start + window_candles <= len(times):
-        end = start + window_candles
+    return months
 
-        w_times = times[start:end]
-        w_closes = {c: v[start:end] for c, v in closes.items()}
-        w_highs = {c: v[start:end] for c, v in highs.items()}
 
-        best_v, best_ret = None, None
+def monthly_pnls(result, months):
+    # Profitto realizzato per ciascun mese di calendario nel periodo, nello
+    # stesso ordine di 'months'. Un mese senza vendite vale 0.0 (non viene
+    # saltato): un parametro che resta fermo per mesi deve pesare come tale.
+    mr = result["monthly_realized"]
+    return [mr.get(m, 0.0) for m in months]
 
-        for v in candidates:
-            r = sim_fn(w_times, w_closes, w_highs, v)
 
-            if best_ret is None or r["ret"] > best_ret:
-                best_v, best_ret = v, r["ret"]
+def find_target_param(label, times, closes, highs, candidates, months, sim_fn, target, results):
+    # Generico: usato sia per il DIP che per il TP. Al posto di "quale valore
+    # vince piu' finestre" (astratto, slegato da un obiettivo concreto),
+    # sceglie il valore la cui MEDIANA di profitto realizzato per mese di
+    # calendario e' piu' vicina a TARGET_MONTHLY_PROFIT, con una singola
+    # simulazione continua sull'intero periodo (non finestre indipendenti:
+    # i lotti apribili in un mese possono chiudersi nel mese successivo,
+    # come accade davvero al bot). La deviazione standard tra i mesi serve
+    # da criterio secondario: tra due valori ugualmente vicini al target,
+    # vince quello piu' COSTANTE mese per mese, non quello con un singolo
+    # mese fortunato che alza la media.
+    print(f"\nRICERCA {label} PER OBIETTIVO ~${target:.0f}/MESE (mediana su {len(months)} mesi di calendario)")
+    print("-" * 70)
+    print(f"{label:<8} {'mediana €/mese':>15} {'dev.std':>10} {'scarto da target':>18} {'rendimento tot.':>16}")
 
-        wins[best_v] += 1
-        windows_tested += 1
-        start += step_candles
-
-    print(f"\nFREQUENZA VITTORIE {label} SU {windows_tested} FINESTRE DA {WINDOW_DAYS}gg (passo {STEP_DAYS}gg)")
-    print("-" * 40)
+    scored = []
 
     for v in candidates:
-        pct = wins[v] / windows_tested * 100 if windows_tested else 0
-        bar = "#" * round(pct / 5)
-        print(f"{label} {v:>5.1f}% | {wins[v]:>2} vittorie ({pct:>4.0f}%) {bar}")
+        r = sim_fn(times, closes, highs, v)
+        pnls = monthly_pnls(r, months)
 
-    if windows_tested == 0:
-        log(f"RICERCA {label} | periodo troppo corto per finestre da {WINDOW_DAYS}gg")
-        return candidates[0], wins
+        median = statistics.median(pnls)
+        stdev = statistics.pstdev(pnls) if len(pnls) > 1 else 0.0
+        diff = abs(median - target)
 
-    max_wins = max(wins.values())
-    tied = [v for v in candidates if wins[v] == max_wins]
-    tied_pct = max_wins / windows_tested * 100
+        scored.append((diff, stdev, v, r, median))
 
-    if len(tied) == 1:
-        robust_v = tied[0]
-        print(f"\n-> {label} PIU' FREQUENTE: {robust_v:.1f}% (vince nel {tied_pct:.0f}% delle finestre)\n")
-    else:
-        by_ret = {r[label.lower()]: r["ret"] for r in results}
-        robust_v = max(tied, key=lambda v: by_ret.get(v, float("-inf")))
-        tied_str = ", ".join(f"{v:.1f}%" for v in tied)
+        print(f"{v:>6.1f}% {median:>15.2f} {stdev:>10.2f} {diff:>18.2f} {r['ret']:>15.2f}%")
 
-        print(f"\n-> PAREGGIO {label} nel {tied_pct:.0f}% delle finestre tra: {tied_str}")
-        print("   Nessun valore e' chiaramente piu' frequente: questo periodo ha probabilmente regimi diversi.")
-        print(f"   Scelto {robust_v:.1f}% come criterio secondario (rendimento piu' alto sul periodo intero tra i pareggiati).\n")
+    scored.sort(key=lambda x: (x[0], x[1]))  # scarto dal target, poi costanza
 
-    return robust_v, wins
+    best_diff, best_stdev, best_v, best_r, best_median = scored[0]
+
+    print(f"\n-> {label} PIU' VICINO ALL'OBIETTIVO: {best_v:.1f}% (mediana ${best_median:.2f}/mese, scarto ${best_diff:.2f}, dev.std ${best_stdev:.2f})\n")
+
+    return best_v, best_r, best_median, best_stdev
 
 
-def verdict_text(current, combined, current_required, combined_required):
-    # Giudizio esplicito, non solo numeri: confronta lo scenario combinato
-    # (DIP e TP piu' frequenti, trovati in cascata) con quello attuale su
-    # tre assi — rendimento, BUY saltati, capitale necessario — perche' una
-    # frequenza di vittoria alta su finestre brevi NON garantisce un
-    # risultato migliore sul periodo intero (un TP alto, per esempio, puo'
-    # vincere spesso in finestre isolate e allo stesso tempo bloccare piu'
-    # capitale sul periodo intero, con piu' BUY saltati).
-    # Tolleranza sul rendimento (punti percentuali): un rendimento di poco
-    # inferiore non scarta automaticamente lo scenario se il rischio e' molto
-    # piu' basso — un drawdown piu' contenuto e meno BUY saltati possono
-    # valere piu' di qualche punto percentuale di rendimento in meno,
-    # specialmente con poco capitale.
-    RET_TOLERANCE_PP = 5.0
+def monthly_verdict_text(target, current_median, current_stdev, combined_median, combined_stdev,
+                          current, combined, current_required, combined_required):
+    # Giudizio esplicito, non solo numeri: l'obiettivo e' avvicinare la
+    # mediana di profitto REALIZZATO per mese di calendario a
+    # TARGET_MONTHLY_PROFIT, in modo COSTANTE (dev.std bassa), non ottenere
+    # un rendimento totale piu' alto che magari dipende da un solo mese
+    # fortunato. Buy saltati e capitale necessario restano criteri di
+    # rischio secondari, menzionati ma non decisivi da soli.
+    current_diff = abs(current_median - target)
+    combined_diff = abs(combined_median - target)
 
-    better_ret = combined["ret"] > current["ret"]
-    similar_ret = combined["ret"] >= current["ret"] - RET_TOLERANCE_PP
+    closer_to_target = combined_diff < current_diff
+    more_consistent = combined_stdev < current_stdev
     not_worse_missed = combined["missed_buys"] <= current["missed_buys"]
     not_worse_capital = combined_required <= current_required
-    lower_risk = combined["dd"] < current["dd"]
 
-    if better_ret and not_worse_missed and not_worse_capital:
+    risk_notes = []
+
+    if not not_worse_missed:
+        risk_notes.append(f"salta piu' BUY ({combined['missed_buys']} contro {current['missed_buys']})")
+
+    if not not_worse_capital:
+        risk_notes.append(f"richiede piu' capitale (${combined_required:.2f} contro ${current_required:.2f})")
+
+    risk_suffix = f" Attenzione: {' e '.join(risk_notes)}." if risk_notes else ""
+
+    if closer_to_target and more_consistent:
         return (
-            "MIGLIORAMENTO su tutti gli indicatori: rendimento piu' alto, BUY saltati non "
-            "peggiori, capitale necessario non superiore. E' il caso piu' solido per valutare "
-            "un cambio dei parametri, ma resta un risultato su un solo periodo passato."
+            f"PIU' VICINO E PIU' COSTANTE: mediana ${combined_median:.2f}/mese (obiettivo ${target:.0f}) "
+            f"contro ${current_median:.2f}/mese attuale, con meno variabilita' tra un mese e l'altro "
+            f"(dev.std ${combined_stdev:.2f} contro ${current_stdev:.2f})." + risk_suffix
         )
 
-    if not better_ret and similar_ret and not_worse_missed and not_worse_capital and lower_risk:
+    if closer_to_target and not more_consistent:
         return (
-            f"RENDIMENTO COMPARABILE CON RISCHIO MOLTO PIU' BASSO: {combined['ret']:+.2f}% contro "
-            f"{current['ret']:+.2f}% attuale (entro {RET_TOLERANCE_PP:.0f} punti), ma drawdown "
-            f"{combined['dd']:.2f}% contro {current['dd']:.2f}% e BUY saltati {combined['missed_buys']} "
-            f"contro {current['missed_buys']}. Con poco capitale questo profilo (meno rischio, capitale "
-            "quasi tutto utilizzabile) puo' valere piu' di qualche punto di rendimento in meno: "
-            "da valutare seriamente, non solo come alternativa minore."
+            f"PIU' VICINO ALL'OBIETTIVO ma meno costante: mediana ${combined_median:.2f}/mese "
+            f"(obiettivo ${target:.0f}) contro ${current_median:.2f}/mese attuale, ma la variabilita' "
+            f"tra i mesi e' maggiore (dev.std ${combined_stdev:.2f} contro ${current_stdev:.2f}): "
+            "alcuni mesi potrebbero rendere molto piu' o molto meno del target." + risk_suffix
         )
 
-    if better_ret and (not not_worse_missed or not not_worse_capital):
-        problems = []
-
-        if not not_worse_missed:
-            problems.append(f"salta piu' BUY ({combined['missed_buys']} contro {current['missed_buys']})")
-
-        if not not_worse_capital:
-            problems.append(f"richiede piu' capitale (${combined_required:.2f} contro ${current_required:.2f})")
-
+    if not closer_to_target and more_consistent:
         return (
-            f"RENDIMENTO PIU' ALTO ma non e' un miglioramento netto: {' e '.join(problems)}. "
-            "La frequenza di vittoria alta nelle finestre brevi non si traduce in un vantaggio "
-            "pulito sul periodo intero: valutalo con cautela, non applicarlo solo perche' vince spesso."
+            f"PIU' COSTANTE ma piu' lontano dall'obiettivo: mediana ${combined_median:.2f}/mese contro "
+            f"${current_median:.2f}/mese attuale (obiettivo ${target:.0f}), con meno variabilita' tra i "
+            f"mesi (dev.std ${combined_stdev:.2f} contro ${current_stdev:.2f}). Puo' valere la pena se "
+            "preferisci un risultato piu' prevedibile a uno piu' vicino al target ma irregolare." + risk_suffix
         )
 
     return (
-        "NESSUN MIGLIORAMENTO chiaro rispetto ai parametri attuali in questo periodo: il "
-        "rendimento non supera quello attuale. I parametri attuali restano la scelta piu' "
-        "difendibile per ora."
+        f"NESSUN VANTAGGIO chiaro rispetto ai parametri attuali verso l'obiettivo di ${target:.0f}/mese: "
+        f"mediana ${combined_median:.2f}/mese contro ${current_median:.2f}/mese attuale, ne' piu' vicina "
+        "ne' piu' costante. I parametri attuali restano la scelta piu' difendibile per ora." + risk_suffix
     )
+
+
 
 
 # Cache in memoria del servizio Railway.
@@ -842,55 +856,64 @@ def run():
     print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {CURRENT_TP_PERCENT:.1f}%)", current_result, args, closes, days)
 
     # ========================================================
-    # 1) TROVA IL DIP MIGLIORE (TP tenuto fisso a quello attuale)
+    # MESI DI CALENDARIO COPERTI DAI DATI (non finestre arbitrarie)
+    # ========================================================
+    months = calendar_months_in_range(times)
+    current_monthly = monthly_pnls(current_result, months)
+    current_median = statistics.median(current_monthly)
+    current_mstdev = statistics.pstdev(current_monthly) if len(current_monthly) > 1 else 0.0
+
+    print(f"\nMESI DI CALENDARIO NEL PERIODO: {months[0]} -> {months[-1]} ({len(months)} mesi)")
+    print(f"Parametri attuali: mediana ${current_median:.2f}/mese (dev.std ${current_mstdev:.2f}), obiettivo ${TARGET_MONTHLY_PROFIT:.0f}/mese")
+
+    # ========================================================
+    # 1) TROVA IL DIP CHE AVVICINA PIU' LA MEDIANA MENSILE ALL'OBIETTIVO
+    #    (TP tenuto fisso a quello attuale)
     # ========================================================
     dip_candidates = build_dip_grid(closes, highs)
-    print(f"\nSTEP 1/2 — RICERCA DIP (TP fisso {CURRENT_TP_PERCENT:.1f}%) | griglia: {', '.join(f'{d:.1f}%' for d in dip_candidates)}")
-
-    dip_results = [simulate(times, closes, highs, BUY_USD, d, CURRENT_TP_PERCENT, interval, args) for d in dip_candidates]
     sim_dip = lambda t, c, h, v: simulate(t, c, h, BUY_USD, v, CURRENT_TP_PERCENT, interval, args)
 
-    robust_dip, _ = find_robust_param("DIP", times, closes, highs, dip_candidates, interval, days, sim_dip, dip_results)
+    robust_dip, _, _, _ = find_target_param("DIP", times, closes, highs, dip_candidates, months, sim_dip, TARGET_MONTHLY_PROFIT, None)
 
     DIP_HISTORY.append(robust_dip)
     del DIP_HISTORY[:-HISTORY_MAX]  # tiene solo gli ultimi HISTORY_MAX cicli
     dip_stability = stability_report("DIP", DIP_HISTORY)
 
     # ========================================================
-    # 2) SUL DIP TROVATO, CERCA IL TP MIGLIORE (non su quello attuale:
-    #    i due parametri vengono incrociati in cascata, non in isolamento)
+    # 2) SUL DIP TROVATO, CERCA IL TP CHE AVVICINA PIU' LA MEDIANA MENSILE
+    #    ALL'OBIETTIVO (non sul DIP attuale: i due parametri vengono
+    #    incrociati in cascata, non cercati in isolamento)
     # ========================================================
     tp_candidates = build_tp_grid(closes)
-    print(f"\nSTEP 2/2 — RICERCA TP (DIP fisso al valore trovato sopra, {robust_dip:.1f}%) | griglia: {', '.join(f'{t:.1f}%' for t in tp_candidates)}")
-
-    tp_results = [simulate(times, closes, highs, BUY_USD, robust_dip, t, interval, args) for t in tp_candidates]
     sim_tp = lambda t, c, h, v: simulate(t, c, h, BUY_USD, robust_dip, v, interval, args)
 
-    robust_tp, _ = find_robust_param("TP", times, closes, highs, tp_candidates, interval, days, sim_tp, tp_results)
+    robust_tp, combined_result, combined_median, combined_mstdev = find_target_param("TP", times, closes, highs, tp_candidates, months, sim_tp, TARGET_MONTHLY_PROFIT, None)
 
     TP_HISTORY.append(robust_tp)
     del TP_HISTORY[:-HISTORY_MAX]
     tp_stability = stability_report("TP", TP_HISTORY)
 
     # ========================================================
-    # 3) SCENARIO COMBINATO: DIP e TP trovati insieme, confrontati in
-    #    blocco con i parametri attuali (non un parametro alla volta)
+    # 3) SCENARIO TROVATO vs PARAMETRI ATTUALI, sull'obiettivo mensile
     # ========================================================
-    combined_result = simulate(times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args)
     combined_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args)
 
     print(f"\n{'=' * 60}")
-    print(f"SCENARIO COMBINATO: DIP {robust_dip:.1f}% + TP {robust_tp:.1f}% (trovati in cascata)")
+    print(f"CONFRONTO SULL'OBIETTIVO DI ${TARGET_MONTHLY_PROFIT:.0f}/MESE: DIP {robust_dip:.1f}% + TP {robust_tp:.1f}% (trovati in cascata)")
     print(f"{'=' * 60}")
-    print(f"{'':25} {'attuale':>15} {'combinato':>15}")
+    print(f"{'':25} {'attuale':>15} {'trovato':>15}")
     print(f"{'DIP / TP':<25} {CURRENT_DIP_PERCENT:>6.1f}/{CURRENT_TP_PERCENT:<6.1f}% {robust_dip:>6.1f}/{robust_tp:<6.1f}%")
-    print(f"{'Rendimento 200gg':<25} {current_result['ret']:>14.2f}% {combined_result['ret']:>14.2f}%")
+    print(f"{'Mediana $/mese':<25} ${current_median:>14.2f} ${combined_median:>14.2f}")
+    print(f"{'Dev.std $/mese':<25} ${current_mstdev:>14.2f} ${combined_mstdev:>14.2f}")
     print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {combined_result['missed_buys']:>15}")
     print(f"{'Max drawdown':<25} {current_result['dd']:>14.2f}% {combined_result['dd']:>14.2f}%")
     print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${combined_required:>14.2f}")
     print(f"{'=' * 60}")
 
-    verdict = verdict_text(current_result, combined_result, current_required, combined_required)
+    verdict = monthly_verdict_text(
+        TARGET_MONTHLY_PROFIT, current_median, current_mstdev, combined_median, combined_mstdev,
+        current_result, combined_result, current_required, combined_required
+    )
 
     print(f"\nINDICAZIONE SULLA STRATEGIA:\n{verdict}\n", flush=True)
 
@@ -898,9 +921,9 @@ def run():
     # RIEPILOGO TELEGRAM
     # ========================================================
     lines = [
-        f"\U0001F4CA Backtest {days:.0f}gg | capitale ${args.capital:.2f}",
-        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> rend. {current_result['ret']:+.2f}%, saltati {current_result['missed_buys']}, capitale nec. ${current_required:.2f}",
-        f"Combinato: DIP {robust_dip:.1f}%/TP {robust_tp:.1f}% -> rend. {combined_result['ret']:+.2f}%, saltati {combined_result['missed_buys']}, capitale nec. ${combined_required:.2f}",
+        f"\U0001F4CA Backtest {len(months)} mesi | capitale ${args.capital:.2f} | obiettivo ${TARGET_MONTHLY_PROFIT:.0f}/mese",
+        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> mediana ${current_median:+.2f}/mese (dev.std ${current_mstdev:.2f})",
+        f"Trovato: DIP {robust_dip:.1f}%/TP {robust_tp:.1f}% -> mediana ${combined_median:+.2f}/mese (dev.std ${combined_mstdev:.2f})",
         f"\U0001F449 {verdict}",
         dip_stability,
         tp_stability,
