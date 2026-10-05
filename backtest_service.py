@@ -10,55 +10,46 @@ tre cose distinte:
    mensile prefissato (TARGET_MONTHLY_PROFIT, default $30/mese).
 
 2) ANALISI ESPLORATIVA E TRACCIAMENTO SOGLIE FREQUENTI: SOLO INFORMATIVA,
-   non cambia il bot. Il periodo viene diviso in MESI DI CALENDARIO (non
-   finestre arbitrarie), e per ciascun DIP/TP candidato si calcola la
-   MEDIANA del profitto REALIZZATO per mese di calendario, su un'UNICA
-   simulazione continua sull'intero periodo (i lotti aperti in un mese
-   possono chiudersi nel mese successivo, come accade davvero al bot: non
-   si riparte da zero a ogni mese). 
+   non cambia il bot. Il periodo viene diviso in MESI DI CALENDARIO e ogni
+   combinazione candidata viene simulata sull'intero periodo in modo continuo.
+   DIP e TP vengono quindi analizzati anche in modo INCROCIATO, non soltanto
+   in cascata.
 
-   - Viene identificata la combinazione ottimale del singolo ciclo (DIP e TP
-     incrociati in cascata su obiettivo mensile) e ne viene calcolato il
-     capitale necessario per raggiungere il target di $30/mese.
-   - I valori ottimali di ogni ciclo vengono salvati in memoria (DIP_HISTORY e
-     TP_HISTORY) per determinare la MODA e la STABILITÀ (frequenza %) dei parametri
-     nel tempo.
-   - Viene generato un SUGGERIMENTO OPERATIVO basato sulla convergenza storica:
-     consiglia di cambiare target solo se la moda differisce dai parametri attuali
-     con una frequenza/stabilità >= 60% e un numero minimo di cicli di osservazione.
+   - Mantiene come baseline reale DIP 2%, TP 4%, BUY_USD attuale ($10 di default).
+   - Per TP 2%, dato SELL_PERCENT=95 e MIN_ORDER_USD=$10, calcola il BUY_USD
+     minimo matematico che rende il SELL eseguibile e testa quel valore e una
+     griglia di BUY superiori.
+   - Per ogni combinazione TP 2% + DIP + BUY viene calcolato il profitto
+     realizzato per mese sulla stessa simulazione continua; si misura quante
+     volte la combinazione è la migliore nel mese (frequenza) e il rendimento
+     complessivo sul periodo.
+   - La combinazione TP 2% più frequente viene confrontata direttamente con il
+     baseline attuale. In caso di pari frequenza prevale il rendimento totale,
+     poi il minor capitale necessario.
+   - L'analisi precedente DIP/TP viene mantenuta come riferimento storico.
 
-3) RIEPILOGO SYNTHETIC SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
-   impostate, invia un messaggio ultra-compatto della seguente struttura:
-   
-     Backtest {X} mesi | capitale ${Cap}
-     Attuale: DIP {X}%/TP {Y}% -> profitto {D}gg: ${P}
-     Capitale x ${Target}/mese: ${CapReq} (req. reale: ${ReqReale})
+3) RIEPILOGO SINTETICO SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
+   impostate, invia un messaggio molto compatto con capitale, risultato attuale,
+   soglie più frequenti, capitale necessario per $30/mese e suggerimento operativo.
 
-     Più frequente: DIP {X}%/TP {Y}% (ottimale ciclo: DIP {A}%/TP {B}%)
-     Capitale x ${Target}/mese (con target ottimali): ${CapOpt}
-
-     Suggerimento: {Suggerimento Operativo}
-
-   Il log completo di tutti i dettagli rimane consultabile nei log di Railway.
+Il log completo di tutti i dettagli rimane consultabile nei log di Railway.
 
 Include il calcolo del capitale reale (USDC + coin gestite + coin extra),
 la gestione dei BUY saltati per fondi insufficienti, la stima del capitale
-tramite raddoppi e bisezione (find_capital_for_monthly_target), cache dei dati e
-dei metadata per tutta la vita del processo (solo le ultime ore vengono
-riscaricate a ogni ciclo, non l'intero periodo), e retry con backoff sulle
-chiamate API in caso di rate limit (429).
+tramite raddoppi e bisezione, cache dei dati e dei metadata per tutta la vita
+del processo e retry con backoff sulle chiamate API in caso di rate limit (429).
 
 Nota sul TP: con BUY_USD basso e SELL_PERCENT=95, il 95% di un lotto vale
 meno del minimo d'ordine finché il prezzo non è salito di circa
-100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95). Un
-TAKE_PROFIT_PERCENT sotto quella soglia non ha alcun effetto: il lotto resta
-scartato dal controllo sul minimo d'ordine indipendentemente dal target. La
-griglia del TP parte sempre da sopra questa soglia.
+100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95). Per TP 2% il codice
+calcola quindi il BUY_USD minimo effettivamente necessario, lasciando sempre
+MIN_ORDER_USD=$10 come minimo dell'ordine di vendita.
 """
 
 import json
 import os
 import statistics
+import math
 import sys
 import time
 import traceback
@@ -651,6 +642,129 @@ def find_target_param(label, times, closes, highs, candidates, months, sim_fn, t
     return best_v, best_r, best_median, best_stdev
 
 
+
+# ============================================================
+# ANALISI INCROCIATA TP 2% + DIP + BUY_USD
+# ============================================================
+
+def minimum_buy_for_tp(tp, sell_percent, min_order, fee):
+    """BUY minimo affinché il SELL_PERCENT del lotto raggiunga MIN_ORDER_USD."""
+    if sell_percent <= 0 or (1 + tp / 100) <= 0:
+        return float("inf")
+    factor = (sell_percent / 100) * (1 + tp / 100) * (1 - fee)
+    return min_order / factor if factor > 0 else float("inf")
+
+
+def build_tp2_buy_grid(a, tp=2.0):
+    """Griglia centrata sul minimo eseguibile, senza mai abbassare MIN_ORDER_USD."""
+    minimum = minimum_buy_for_tp(tp, a.sell_percent, a.min_order, a.fee)
+    minimum = math.ceil(minimum * 100) / 100
+
+    # Il primo valore è il minimo eseguibile al centesimo; gli altri servono
+    # a verificare se un BUY leggermente maggiore migliora robustezza/rendimento.
+    candidates = [
+        minimum,
+        math.ceil((minimum + 0.25) * 100) / 100,
+        math.ceil((minimum + 0.50) * 100) / 100,
+        11.0,
+        12.0,
+        15.0,
+        20.0,
+    ]
+    return sorted(set(round(x, 2) for x in candidates if x > a.min_order))
+
+
+def cross_tp2_analysis(times, closes, highs, dip_grid, months, a, target=2.0):
+    """Analizza DIP x BUY per TP fisso al 2% su simulazioni continue."""
+    buy_grid = build_tp2_buy_grid(a, target)
+    print(f"\nANALISI INCROCIATA TP {target:.1f}% | DIP x BUY_USD")
+    print(f"BUY minimo eseguibile con MIN_ORDER ${a.min_order:.2f}: ${buy_grid[0]:.2f}")
+    print("-" * 90)
+
+    results = []
+    for dip in dip_grid:
+        for buy in buy_grid:
+            r = simulate(times, closes, highs, buy, dip, target, 1, a)
+            pnls = monthly_pnls(r, months)
+            results.append({
+                "dip": dip,
+                "buy": buy,
+                "tp": target,
+                "r": r,
+                "pnls": pnls,
+                "median": statistics.median(pnls),
+            })
+
+    # Frequenza: quante volte la combinazione è prima tra tutte le combinazioni.
+    # In caso di pari profitto mensile, vengono assegnate tutte le combinazioni
+    # a pari merito, così la frequenza non dipende dall'ordine del ciclo.
+    wins = Counter()
+    for idx, month in enumerate(months):
+        vals = [(x["pnls"][idx], x) for x in results]
+        best_month = max(v for v, _ in vals)
+        for value, x in vals:
+            if abs(value - best_month) < 1e-9:
+                wins[(x["dip"], x["buy"])] += 1
+
+    for x in results:
+        x["wins"] = wins[(x["dip"], x["buy"])]
+        x["freq"] = x["wins"] / len(months) * 100 if months else 0.0
+
+    # Prima frequenza, poi rendimento totale, poi capitale richiesto per non
+    # saltare BUY, poi minore BUY. Questo privilegia robustezza senza perdere
+    # il rendimento complessivo.
+    for x in results:
+        x["capital_required"] = capital_needed(
+            times, closes, highs, x["buy"], x["dip"], target, 1, a
+        )
+
+    best = max(
+        results,
+        key=lambda x: (
+            x["freq"],
+            x["r"]["ret"],
+            -x["capital_required"],
+            -x["buy"],
+        ),
+    )
+
+    # Migliore combinazione per rendimento complessivo, utile per il confronto.
+    best_return = max(results, key=lambda x: x["r"]["ret"])
+
+    print(f"Combinazione più frequente: DIP {best['dip']:.1f}% / TP {target:.1f}% / BUY ${best['buy']:.2f} -> {best['freq']:.0f}% dei mesi, rendimento {best['r']['ret']:+.2f}%")
+    print(f"Miglior rendimento pieno periodo: DIP {best_return['dip']:.1f}% / TP {target:.1f}% / BUY ${best_return['buy']:.2f} -> {best_return['r']['ret']:+.2f}%")
+
+    return best, best_return, results, buy_grid
+
+
+def cross_recommendation(current_result, cross_best, cross_best_return, current_required, cross_capital):
+    """Suggerimento basato su frequenza + rendimento, senza sostituire automaticamente il baseline."""
+    cb = cross_best["r"]
+    freq = cross_best["freq"]
+    current_ret = current_result["ret"]
+    cross_ret = cb["ret"]
+
+    if freq >= 60 and cross_ret > current_ret:
+        return (
+            f"Valutare TP 2%: DIP {cross_best['dip']:.1f}% / BUY ${cross_best['buy']:.2f}; "
+            f"vincente nel {freq:.0f}% dei mesi e rendimento {cross_ret:+.2f}% vs attuale {current_ret:+.2f}%."
+        )
+    if freq >= 50 and cross_ret > current_ret:
+        return (
+            f"TP 2% interessante ma non ancora dominante: DIP {cross_best['dip']:.1f}% / BUY ${cross_best['buy']:.2f}; "
+            f"frequenza {freq:.0f}%, rendimento {cross_ret:+.2f}% vs attuale {current_ret:+.2f}%."
+        )
+    if cross_ret > current_ret:
+        return (
+            f"TP 2% ha rendimento superiore ({cross_ret:+.2f}%), ma frequenza solo {freq:.0f}%; "
+            f"per ora mantenere DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}%."
+        )
+    return (
+        f"Mantenere DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}%: "
+        f"TP 2% non supera l'attuale ({cross_ret:+.2f}% vs {current_ret:+.2f}%)."
+    )
+
+
 # ============================================================
 # CACHE E STORICO IN MEMORIA
 # ============================================================
@@ -728,10 +842,11 @@ def run():
     # ============================================================
     # 2) ANALISI ESPLORATIVA & SOGLIE FREQUENTI
     # ============================================================
-    log("\n2) ANALISI ESPLORATIVA DIP E TP SU OBIETTIVO MENSILE...")
+    log("\n2) ANALISI ESPLORATIVA DIP/TP E INCROCIO TP 2%...")
     dip_grid = build_dip_grid(closes, highs)
     tp_grid = build_tp_grid(closes)
 
+    # Analisi storica precedente: DIP e TP in cascata sull'obiettivo mensile.
     best_dip, dip_r, dip_median, dip_stdev = find_target_param(
         "DIP",
         times,
@@ -760,6 +875,18 @@ def run():
         times, closes, highs, BUY_USD, best_dip, best_tp, 1, args, TARGET_MONTHLY_PROFIT, months
     )
 
+    # Nuova analisi richiesta: vero incrocio DIP x BUY con TP 2%, mantenendo
+    # MIN_ORDER_USD = $10. Il BUY minimo viene calcolato, non scelto arbitrariamente.
+    cross_best, cross_best_return, cross_results, tp2_buy_grid = cross_tp2_analysis(
+        times, closes, highs, dip_grid, months, args, target=2.0
+    )
+
+    cross_cap_for_30, _, cross_reach = find_capital_for_monthly_target(
+        times, closes, highs,
+        cross_best["buy"], cross_best["dip"], 2.0, 1, args,
+        TARGET_MONTHLY_PROFIT, months
+    )
+
     DIP_HISTORY.append(best_dip)
     TP_HISTORY.append(best_tp)
     if len(DIP_HISTORY) > HISTORY_MAX:
@@ -773,27 +900,27 @@ def run():
     freq_dip = (sum(1 for x in DIP_HISTORY if abs(x - mode_dip) <= STABILITY_BAND) / n_samples) * 100
     freq_tp = (sum(1 for x in TP_HISTORY if abs(x - mode_tp) <= STABILITY_BAND) / n_samples) * 100
 
-    if n_samples < STABILITY_MIN_SAMPLES:
-        suggestion = "In raccolta dati (pochi cicli per suggerire modifiche)."
-    elif (mode_dip != CURRENT_DIP_PERCENT or mode_tp != CURRENT_TP_PERCENT) and (freq_dip >= 60 and freq_tp >= 60):
-        suggestion = f"CONSIGLIATO CAMBIO -> DIP {mode_dip:.1f}% / TP {mode_tp:.1f}% (stabili al {freq_dip:.0f}%)."
-    elif mode_dip == CURRENT_DIP_PERCENT and mode_tp == CURRENT_TP_PERCENT:
-        suggestion = "Mantenere parametri attuali (coincidono con la moda storica)."
-    else:
-        suggestion = "Parametri variabili tra i cicli: consiglia di mantenere gli attuali per stabilità."
+    suggestion = cross_recommendation(
+        current_result,
+        cross_best,
+        cross_best_return,
+        current_required,
+        cross_cap_for_30,
+    )
 
     # ============================================================
     # 3) MESSAGGIO TELEGRAM SINTETICO
     # ============================================================
-    cap_curr_txt = f"${cap_for_30_curr:.0f}" if (reach_curr and cap_for_30_curr) else "N/D (limite bot)"
-    cap_best_txt = f"${cap_for_30_best:.0f}" if (reach_best and cap_for_30_best) else "N/D (limite bot)"
+    cap_curr_txt = f"${cap_for_30_curr:.0f}" if (reach_curr and cap_for_30_curr) else "N/D"
+    cap_cross_txt = f"${cross_cap_for_30:.0f}" if (cross_reach and cross_cap_for_30) else "N/D"
 
     tg_msg = (
-        f"Backtest {num_months} mesi | capitale ${args.capital:.2f}\n\n"
+        f"Backtest {num_months} mesi | capitale ${args.capital:.2f}\n"
         f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> profitto {BACKTEST_DAYS}gg: ${current_result['realized']:+.2f}\n"
-        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese: {cap_curr_txt} (req. reale: ${current_required:.2f})\n\n"
-        f"Più frequente: DIP {mode_dip:.1f}%/TP {mode_tp:.1f}% (ottimale ciclo: DIP {best_dip:.1f}%/TP {best_tp:.1f}%)\n"
-        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese (con target ottimali): {cap_best_txt}\n\n"
+        f"Più frequente: DIP {mode_dip:.1f}%/TP {mode_tp:.1f}%\n"
+        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese con target attuali: {cap_curr_txt}\n"
+        f"TP 2%: DIP {cross_best['dip']:.1f}% / BUY ${cross_best['buy']:.2f} -> {cross_best['freq']:.0f}% mesi, rendimento {cross_best['r']['ret']:+.2f}%\n"
+        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese TP 2%: {cap_cross_txt}\n"
         f"Suggerimento: {suggestion}"
     )
 
