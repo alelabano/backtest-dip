@@ -375,6 +375,54 @@ def capital_needed(times, closes, highs, buy_usd, dip, tp, interval, a):
     return a.capital + required_extra
 
 
+def find_capital_for_monthly_target(times, closes, highs, buy_usd, dip, tp, interval, a, target, months):
+    # Cerca, provando capitali crescenti (raddoppiando), quello che porta la
+    # mediana mensile al target. Riusa monthly_median_at_capital (stessa
+    # funzione del confronto "capitale sufficiente" qui sopra) invece di
+    # duplicarla. Se la mediana smette di crescere prima di arrivare al
+    # target, il capitale non e' (piu') il vincolo: lo e' qualcos'altro
+    # (MAX_WEEKLY_BUYS o MAX_POSITION_USD), e nessuna quantita' di capitale
+    # aggiuntivo risolverebbe da sola il problema — un'informazione
+    # altrettanto utile del numero stesso.
+    lo = a.capital
+    lo_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, lo, months)
+
+    if lo_median >= target:
+        return lo, lo_median, True
+
+    hi = max(lo * 2, 50.0)
+    prev_median = lo_median
+    hi_median = lo_median
+
+    for _ in range(12):  # fino a 12 raddoppi: lo*4096, ampio margine
+        hi_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, hi, months)
+
+        if hi_median >= target:
+            break
+
+        if hi_median <= prev_median * 1.02:  # non cresce quasi piu': plateau
+            return None, hi_median, False
+
+        prev_median = hi_median
+        hi *= 2
+    else:
+        return None, hi_median, False  # mai arrivato al target in 12 raddoppi
+
+    # bisezione tra lo e hi per restringere il capitale esatto
+    for _ in range(12):
+        mid = (lo + hi) / 2
+        mid_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, mid, months)
+
+        if mid_median >= target:
+            hi = mid
+        else:
+            lo = mid
+
+    final_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, hi, months)
+
+    return hi, final_median, True
+
+
 # ============================================================
 # SERVIZIO
 # ============================================================
@@ -619,6 +667,26 @@ def calendar_months_in_range(times):
     return months
 
 
+def monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, capital, months):
+    # Non basta sapere QUANTO capitale servirebbe per non saltare BUY: serve
+    # anche sapere cosa produrrebbe davvero quel capitale al mese. Rifa' la
+    # simulazione con quel capitale come punto di partenza (non quello reale
+    # attuale), e calcola la stessa mediana mensile usata per il confronto
+    # con l'obiettivo. Con piu' capitale il bot apre piu' posizioni in
+    # parallelo, quindi il profitto in dollari sale anche se il rendimento
+    # percentuale puo' restare simile o scendere leggermente.
+    a2 = SimpleNamespace(**vars(a))
+    a2.capital = capital
+
+    r = simulate(times, closes, highs, buy_usd, dip, tp, interval, a2)
+    pnls = monthly_pnls(r, months)
+
+    median = statistics.median(pnls)
+    stdev = statistics.pstdev(pnls) if len(pnls) > 1 else 0.0
+
+    return median, stdev, r
+
+
 def monthly_pnls(result, months):
     # Profitto realizzato per ciascun mese di calendario nel periodo, nello
     # stesso ordine di 'months'. Un mese senza vendite vale 0.0 (non viene
@@ -847,10 +915,16 @@ def run():
     print(f"\n{'#' * 60}")
     print(f"# PARAMETRI ATTUALI DEL BOT: DIP {CURRENT_DIP_PERCENT:.1f}% | TP {CURRENT_TP_PERCENT:.1f}%")
     print(f"{'#' * 60}")
+    total_profit_current = args.capital * current_result["ret"] / 100
+    months_in_period = days / 30.44  # mese medio, solo per la stima lineare qui sotto
+
     print(f"Capitale attuale:    ${args.capital:>10.2f}")
+    print(f"Profitto totale sui {days:.0f}gg (~{months_in_period:.1f} mesi), sul capitale reale: ${total_profit_current:+.2f}", end="")
+    print(f"  (~${total_profit_current / months_in_period:+.2f}/mese se diviso in parti uguali — NON e' il modo corretto di stimarlo, vedi la mediana calendario qui sotto, che e' piu' affidabile)")
     print(f"BUY saltati (200gg): {current_result['missed_buys']:>10}")
     print(f"Capitale necessario per non saltarne nessuno: ${current_required:.2f}", end="")
     print(f"  (mancano ${max(0.0, current_required - args.capital):.2f})" if current_required > args.capital else "  (sufficiente)")
+    print("ATTENZIONE: il capitale necessario qui sopra e' un'altra simulazione (quanto servirebbe per non saltare BUY), NON la base su cui e' calcolato il rendimento sopra, che resta sempre il capitale reale.")
     print(f"{'#' * 60}\n", flush=True)
 
     print_report(f"PERFORMANCE CON I PARAMETRI ATTUALI (DIP {CURRENT_DIP_PERCENT:.1f}%, TP {CURRENT_TP_PERCENT:.1f}%)", current_result, args, closes, days)
@@ -864,7 +938,33 @@ def run():
     current_mstdev = statistics.pstdev(current_monthly) if len(current_monthly) > 1 else 0.0
 
     print(f"\nMESI DI CALENDARIO NEL PERIODO: {months[0]} -> {months[-1]} ({len(months)} mesi)")
-    print(f"Parametri attuali: mediana ${current_median:.2f}/mese (dev.std ${current_mstdev:.2f}), obiettivo ${TARGET_MONTHLY_PROFIT:.0f}/mese")
+    print(f"Parametri attuali, sul capitale REALE (${args.capital:.2f}): mediana ${current_median:.2f}/mese (dev.std ${current_mstdev:.2f}), obiettivo ${TARGET_MONTHLY_PROFIT:.0f}/mese")
+
+    # Cosa produrrebbe lo STESSO DIP/TP attuale se il capitale fosse quello
+    # necessario a non saltare BUY (non il massimo teorico, lo standard
+    # raggiungibile con fondi adeguati a questi parametri).
+    current_suff_median, current_suff_stdev, current_suff_result = monthly_median_at_capital(
+        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args, current_required, months
+    )
+    print(f"Stessi parametri, con capitale sufficiente (${current_required:.2f}): mediana ${current_suff_median:.2f}/mese (dev.std ${current_suff_stdev:.2f})")
+
+    # Non e' detto che il capitale sufficiente (solo fondi per non saltare
+    # BUY) basti anche per l'obiettivo di TARGET_MONTHLY_PROFIT: con gli
+    # stessi parametri attuali, cerca per davvero (non linearmente) quale
+    # capitale ci vorrebbe per arrivarci, provando capitali crescenti.
+    target_capital, target_capital_median, target_reachable = find_capital_for_monthly_target(
+        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args, TARGET_MONTHLY_PROFIT, months
+    )
+
+    if target_reachable:
+        print(f"Capitale per arrivare a ${TARGET_MONTHLY_PROFIT:.0f}/mese con questi stessi parametri: ${target_capital:.2f} (mediana attesa ${target_capital_median:.2f}/mese)")
+    else:
+        print(
+            f"ATTENZIONE: con questi parametri la mediana mensile si FERMA a circa ${target_capital_median:.2f}/mese "
+            f"anche con molto piu' capitale di quello provato: il vincolo non e' (solo) il capitale, probabilmente "
+            "e' MAX_WEEKLY_BUYS o MAX_POSITION_USD. Aumentare il capitale da solo non basterebbe a raggiungere "
+            f"${TARGET_MONTHLY_PROFIT:.0f}/mese con questi parametri."
+        )
 
     # ========================================================
     # 1) TROVA IL DIP CHE AVVICINA PIU' LA MEDIANA MENSILE ALL'OBIETTIVO
@@ -898,31 +998,44 @@ def run():
     # ========================================================
     combined_required = capital_needed(times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args)
 
+    # Stesso ragionamento per i parametri trovati: cosa producono davvero
+    # con il capitale che servirebbe a loro (non quello attuale, che e'
+    # un vincolo di cassa, non una proprieta' dei parametri).
+    combined_suff_median, combined_suff_stdev, combined_suff_result = monthly_median_at_capital(
+        times, closes, highs, BUY_USD, robust_dip, robust_tp, interval, args, combined_required, months
+    )
+
     print(f"\n{'=' * 60}")
     print(f"CONFRONTO SULL'OBIETTIVO DI ${TARGET_MONTHLY_PROFIT:.0f}/MESE: DIP {robust_dip:.1f}% + TP {robust_tp:.1f}% (trovati in cascata)")
     print(f"{'=' * 60}")
-    print(f"{'':25} {'attuale':>15} {'trovato':>15}")
-    print(f"{'DIP / TP':<25} {CURRENT_DIP_PERCENT:>6.1f}/{CURRENT_TP_PERCENT:<6.1f}% {robust_dip:>6.1f}/{robust_tp:<6.1f}%")
-    print(f"{'Mediana $/mese':<25} ${current_median:>14.2f} ${combined_median:>14.2f}")
-    print(f"{'Dev.std $/mese':<25} ${current_mstdev:>14.2f} ${combined_mstdev:>14.2f}")
-    print(f"{'BUY saltati':<25} {current_result['missed_buys']:>15} {combined_result['missed_buys']:>15}")
-    print(f"{'Max drawdown':<25} {current_result['dd']:>14.2f}% {combined_result['dd']:>14.2f}%")
-    print(f"{'Capitale necessario':<25} ${current_required:>14.2f} ${combined_required:>14.2f}")
+    print(f"{'':35} {'attuale':>15} {'trovato':>15}")
+    print(f"{'DIP / TP':<35} {CURRENT_DIP_PERCENT:>6.1f}/{CURRENT_TP_PERCENT:<6.1f}% {robust_dip:>6.1f}/{robust_tp:<6.1f}%")
+    print(f"{'Capitale necessario':<35} ${current_required:>14.2f} ${combined_required:>14.2f}")
+    print(f"{'Mediana $/mese (capitale REALE)':<35} ${current_median:>14.2f} ${combined_median:>14.2f}")
+    print(f"{'Mediana $/mese (capitale sufficiente)':<35} ${current_suff_median:>14.2f} ${combined_suff_median:>14.2f}")
+    print(f"{'Dev.std $/mese (capitale sufficiente)':<35} ${current_suff_stdev:>14.2f} ${combined_suff_stdev:>14.2f}")
+    print(f"{'BUY saltati (capitale REALE)':<35} {current_result['missed_buys']:>15} {combined_result['missed_buys']:>15}")
+    print(f"{'Max drawdown (capitale REALE)':<35} {current_result['dd']:>14.2f}% {combined_result['dd']:>14.2f}%")
     print(f"{'=' * 60}")
 
+    # Il confronto usa i numeri A CAPITALE SUFFICIENTE per ciascuno scenario,
+    # non quelli sul capitale reale attuale: altrimenti si confonderebbe
+    # "i parametri sono buoni" con "ho abbastanza soldi oggi", che sono due
+    # domande diverse. Con capitale adeguato i BUY saltati tendono a zero
+    # per entrambi gli scenari (e' l'effetto voluto, non un errore).
     verdict = monthly_verdict_text(
-        TARGET_MONTHLY_PROFIT, current_median, current_mstdev, combined_median, combined_mstdev,
-        current_result, combined_result, current_required, combined_required
+        TARGET_MONTHLY_PROFIT, current_suff_median, current_suff_stdev, combined_suff_median, combined_suff_stdev,
+        current_suff_result, combined_suff_result, current_required, combined_required
     )
 
-    print(f"\nINDICAZIONE SULLA STRATEGIA:\n{verdict}\n", flush=True)
+    print(f"\nINDICAZIONE SULLA STRATEGIA (a capitale sufficiente per ciascuno scenario):\n{verdict}\n", flush=True)
 
     # ========================================================
     # RIEPILOGO TELEGRAM
     # ========================================================
     lines = [
         f"\U0001F4CA Backtest {len(months)} mesi | capitale ${args.capital:.2f} | obiettivo ${TARGET_MONTHLY_PROFIT:.0f}/mese",
-        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> mediana ${current_median:+.2f}/mese (dev.std ${current_mstdev:.2f})",
+        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> profitto {days:.0f}gg: ${total_profit_current:+.2f} | mediana ${current_median:+.2f}/mese (dev.std ${current_mstdev:.2f})",
         f"Trovato: DIP {robust_dip:.1f}%/TP {robust_tp:.1f}% -> mediana ${combined_median:+.2f}/mese (dev.std ${combined_mstdev:.2f})",
         f"\U0001F449 {verdict}",
         dip_stability,
