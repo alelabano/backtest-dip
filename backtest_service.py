@@ -1,62 +1,24 @@
 """
-Servizio backtest per Railway. Ogni LOOP_INTERVAL_SECONDS (default 4 ore) fa
-tre cose distinte:
+BACKTEST / MARKET REGIME ANALYZER - Hyperliquid Spot
 
-1) CAPITALE NECESSARIO PER I PARAMETRI ATTUALI DEL BOT: simula il bot con i
-   parametri realmente in uso (DIP_PERCENT e TAKE_PROFIT_PERCENT letti
-   dall'ambiente, gli stessi del bot vero) sugli ultimi BACKTEST_DAYS giorni,
-   e calcola sia quanto capitale servirebbe per non saltare nessun BUY con le
-   impostazioni correnti, sia quanto capitale servirebbe per raggiungere l'obiettivo
-   mensile prefissato (TARGET_MONTHLY_PROFIT, default $30/mese).
+Logica:
+1) Simula i parametri attuali del bot.
+2) Analizza gli ultimi 30 giorni per classificare il mercato:
+   BULLISH / BEARISH / NEUTRAL.
+3) Misura DIP e TP fisiologici osservati nel periodo.
+4) Confronta il mese corrente con i mesi storici dello stesso regime.
+5) Suggerisce DIP/TP in funzione del regime e della statistica storica.
+6) Conserva uno storico JSON per mese/regime.
+7) Mantiene il calcolo del capitale necessario e del target mensile.
+8) Invia un riepilogo compatto a Telegram.
 
-2) ANALISI ESPLORATIVA E TRACCIAMENTO SOGLIE FREQUENTI: SOLO INFORMATIVA,
-   non cambia il bot. Il periodo viene diviso in MESI DI CALENDARIO (non
-   finestre arbitrarie), e per ciascun DIP/TP candidato si calcola la
-   MEDIANA del profitto REALIZZATO per mese di calendario, su un'UNICA
-   simulazione continua sull'intero periodo (i lotti aperti in un mese
-   possono chiudersi nel mese successivo, come accade davvero al bot: non
-   si riparte da zero a ogni mese). 
-
-   - Viene identificata la combinazione ottimale del singolo ciclo (DIP e TP
-     incrociati in cascata su obiettivo mensile) e ne viene calcolato il
-     capitale necessario per raggiungere il target di $30/mese.
-   - I valori ottimali di ogni ciclo vengono salvati in memoria (DIP_HISTORY e
-     TP_HISTORY) per determinare la MODA e la STABILITÀ (frequenza %) dei parametri
-     nel tempo.
-   - Viene generato un SUGGERIMENTO OPERATIVO basato sulla convergenza storica:
-     consiglia di cambiare target solo se la moda differisce dai parametri attuali
-     con una frequenza/stabilità >= 60% e un numero minimo di cicli di osservazione.
-
-3) RIEPILOGO SYNTHETIC SU TELEGRAM: se TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID sono
-   impostate, invia un messaggio ultra-compatto della seguente struttura:
-   
-     Backtest {X} mesi | capitale ${Cap}
-     Attuale: DIP {X}%/TP {Y}% -> profitto {D}gg: ${P}
-     Capitale x ${Target}/mese: ${CapReq} (req. reale: ${ReqReale})
-
-     Più frequente: DIP {X}%/TP {Y}% (ottimale ciclo: DIP {A}%/TP {B}%)
-     Capitale x ${Target}/mese (con target ottimali): ${CapOpt}
-
-     Suggerimento: {Suggerimento Operativo}
-
-   Il log completo di tutti i dettagli rimane consultabile nei log di Railway.
-
-Include il calcolo del capitale reale (USDC + coin gestite + coin extra),
-la gestione dei BUY saltati per fondi insufficienti, la stima del capitale
-tramite raddoppi e bisezione (find_capital_for_monthly_target), cache dei dati e
-dei metadata per tutta la vita del processo (solo le ultime ore vengono
-riscaricate a ogni ciclo, non l'intero periodo), e retry con backoff sulle
-chiamate API in caso di rate limit (429).
-
-Nota sul TP: con BUY_USD basso e SELL_PERCENT=95, il 95% di un lotto vale
-meno del minimo d'ordine finché il prezzo non è salito di circa
-100/SELL_PERCENT*100 - 100 % (~5.3% con SELL_PERCENT=95). Un
-TAKE_PROFIT_PERCENT sotto quella soglia non ha alcun effetto: il lotto resta
-scartato dal controllo sul minimo d'ordine indipendentemente dal target. La
-griglia del TP parte sempre da sopra questa soglia.
+NOTA:
+- HISTORY_FILE deve stare su un Railway Volume se si vuole persistenza
+  anche dopo il redeploy/restart del servizio.
 """
 
 import json
+import math
 import os
 import statistics
 import sys
@@ -64,16 +26,20 @@ import time
 import traceback
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
 from dotenv import load_dotenv
 
 HOUR_MS = 3600 * 1000
+DAY_HOURS = 24
+ANALYSIS_DAYS = 30
+ANALYSIS_HOURS = ANALYSIS_DAYS * DAY_HOURS
 
 
 # ============================================================
-# RETRY CON BACKOFF SULLE CHIAMATE API (rate limit 429)
+# RETRY API
 # ============================================================
 
 def _with_retry(fn, *args, attempts=4, base_delay=5, **kwargs):
@@ -86,15 +52,17 @@ def _with_retry(fn, *args, attempts=4, base_delay=5, **kwargs):
 
             if rate_limited and attempt < attempts:
                 delay = base_delay * attempt
-                log(f"API RATE LIMIT (429) | tentativo {attempt}/{attempts}, riprovo in {delay}s")
+                log(
+                    f"API RATE LIMIT (429) | tentativo "
+                    f"{attempt}/{attempts}, riprovo in {delay}s"
+                )
                 time.sleep(delay)
                 continue
-
             raise
 
 
 # ============================================================
-# DATI E SIMULAZIONE
+# DATI
 # ============================================================
 
 def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
@@ -114,9 +82,7 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
 
     end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     full_start_ms = end_ms - days * 24 * HOUR_MS
-
-    UPDATE_HOURS = 6
-    incremental_start_ms = end_ms - UPDATE_HOURS * HOUR_MS
+    incremental_start_ms = end_ms - 6 * HOUR_MS
 
     data = {}
     if existing_data:
@@ -143,13 +109,14 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
                     break
 
         if not market:
-            log(f"ATTENZIONE: nessun mercato spot {coin}/USDC: coin ignorata")
+            log(f"ATTENZIONE: nessun mercato spot {coin}/USDC")
             continue
 
-        if coin in data and data[coin]:
-            start_ms = incremental_start_ms
-        else:
-            start_ms = full_start_ms
+        start_ms = (
+            incremental_start_ms
+            if coin in data and data[coin]
+            else full_start_ms
+        )
 
         candles = _with_retry(
             info.candles_snapshot,
@@ -163,6 +130,7 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
             {
                 "t": c["t"],
                 "h": float(c["h"]),
+                "l": float(c.get("l", c["c"])),
                 "c": float(c["c"]),
             }
             for c in candles
@@ -173,7 +141,6 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
             continue
 
         merged = {c["t"]: c for c in data[coin]}
-
         for candle in new_candles:
             merged[candle["t"]] = candle
 
@@ -189,20 +156,45 @@ def fetch_candles(coins, days, existing_data=None, info=None, meta=None):
 
 
 def align(data):
-    common = sorted(set.intersection(*[{c["t"] for c in v} for v in data.values()]))
+    valid = {c: v for c, v in data.items() if v}
+
+    if not valid:
+        raise RuntimeError("Nessun dato disponibile")
+
+    common = sorted(
+        set.intersection(
+            *[{c["t"] for c in v} for v in valid.values()]
+        )
+    )
 
     closes = {}
     highs = {}
+    lows = {}
 
-    for coin, v in data.items():
-        by_t = {c["t"]: c for c in v}
+    for coin, values in valid.items():
+        by_t = {c["t"]: c for c in values}
         closes[coin] = [by_t[t]["c"] for t in common]
         highs[coin] = [by_t[t]["h"] for t in common]
+        lows[coin] = [by_t[t]["l"] for t in common]
 
-    return common, closes, highs
+    return common, closes, highs, lows
 
 
-def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash=False):
+# ============================================================
+# SIMULAZIONE BOT
+# ============================================================
+
+def simulate(
+    times,
+    closes,
+    highs,
+    buy_usd,
+    dip,
+    tp,
+    interval,
+    a,
+    unlimited_cash=False,
+):
     coins = list(closes)
 
     usdc = a.capital
@@ -215,26 +207,51 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
     peak = a.capital
     max_dd = 0.0
     max_deployed = 0.0
-    per = {c: {"buys": 0, "sells": 0, "realized": 0.0} for c in coins}
     missed_buys = 0
     min_cash = a.capital
+
+    per = {
+        c: {
+            "buys": 0,
+            "sells": 0,
+            "realized": 0.0,
+        }
+        for c in coins
+    }
+
     monthly_realized = {}
 
     for i in range(23, len(times), interval):
         px = {c: closes[c][i] for c in coins}
 
-        equity = usdc + sum(l["qty"] * px[l["coin"]] for l in lots)
-        peak = max(peak, equity)
-        max_dd = max(max_dd, (peak - equity) / peak * 100) if peak > 0 else 0.0
-        max_deployed = max(max_deployed, sum(l["qty"] * l["cost"] for l in lots))
+        equity = usdc + sum(
+            l["qty"] * px[l["coin"]]
+            for l in lots
+        )
 
-        # ---- SELL ----
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = max(
+                max_dd,
+                (peak - equity) / peak * 100,
+            )
+
+        max_deployed = max(
+            max_deployed,
+            sum(l["qty"] * l["cost"] for l in lots),
+        )
+
+        # SELL
         best = None
 
         for lot in lots:
             p = px[lot["coin"]]
 
-            if p >= lot["target"] and lot["qty"] * a.sell_percent / 100 * p >= a.min_order:
+            if (
+                p >= lot["target"]
+                and lot["qty"] * a.sell_percent / 100 * p
+                >= a.min_order
+            ):
                 ret = p / lot["buy_price"]
 
                 if best is None or ret > best[0]:
@@ -243,35 +260,70 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
         if best:
             lot = best[1]
             qty = lot["qty"] * a.sell_percent / 100
-            proceeds = qty * px[lot["coin"]] * (1 - a.slippage) * (1 - a.fee)
+
+            proceeds = (
+                qty
+                * px[lot["coin"]]
+                * (1 - a.slippage)
+                * (1 - a.fee)
+            )
 
             usdc += proceeds
+
             pnl = proceeds - qty * lot["cost"]
             realized += pnl
+
             per[lot["coin"]]["realized"] += pnl
 
-            month_key = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%Y-%m")
-            monthly_realized[month_key] = monthly_realized.get(month_key, 0.0) + pnl
+            month_key = datetime.fromtimestamp(
+                times[i] / 1000,
+                timezone.utc,
+            ).strftime("%Y-%m")
+
+            monthly_realized[month_key] = (
+                monthly_realized.get(month_key, 0.0)
+                + pnl
+            )
 
             per[lot["coin"]]["sells"] += 1
             lot["qty"] -= qty
             sells += 1
             continue
 
-        # ---- BUY ----
-        week = datetime.fromtimestamp(times[i] / 1000, timezone.utc).strftime("%G-W%V")
+        # BUY
+        week = datetime.fromtimestamp(
+            times[i] / 1000,
+            timezone.utc,
+        ).strftime("%G-W%V")
 
         drops = []
 
         for c in coins:
-            open_lots = [l for l in lots if l["coin"] == c]
+            open_lots = [
+                l for l in lots
+                if l["coin"] == c
+            ]
 
             if open_lots:
-                reference = min(l["buy_price"] for l in open_lots)
+                reference = min(
+                    l["buy_price"]
+                    for l in open_lots
+                )
             else:
-                reference = max(highs[c][i - 23:i + 1])
+                reference = max(
+                    highs[c][i - 23:i + 1]
+                )
 
-            drops.append(((reference - px[c]) / reference * 100, c))
+            if reference > 0:
+                drop = (
+                    (reference - px[c])
+                    / reference
+                    * 100
+                )
+            else:
+                drop = 0.0
+
+            drops.append((drop, c))
 
         drops.sort(reverse=True)
 
@@ -281,9 +333,19 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
             if drop < dip:
                 break
 
-            held = sum(l["qty"] for l in lots if l["coin"] == c) * px[c]
+            held = (
+                sum(
+                    l["qty"]
+                    for l in lots
+                    if l["coin"] == c
+                )
+                * px[c]
+            )
 
-            if held + buy_usd > a.max_position or weekly.get(week, 0) >= a.weekly_buys:
+            if (
+                held + buy_usd > a.max_position
+                or weekly.get(week, 0) >= a.weekly_buys
+            ):
                 continue
 
             if not unlimited_cash and usdc < buy_usd:
@@ -295,7 +357,17 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
 
             usdc -= buy_usd
             min_cash = min(min_cash, usdc)
-            lots.append({"coin": c, "qty": qty, "buy_price": fill, "target": fill * (1 + tp / 100), "cost": buy_usd / qty})
+
+            lots.append(
+                {
+                    "coin": c,
+                    "qty": qty,
+                    "buy_price": fill,
+                    "target": fill * (1 + tp / 100),
+                    "cost": buy_usd / qty,
+                }
+            )
+
             weekly[week] = weekly.get(week, 0) + 1
             per[c]["buys"] += 1
             buys += 1
@@ -305,23 +377,60 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
         if cash_blocked:
             missed_buys += 1
 
-    last = {c: closes[c][-1] for c in coins}
-    open_value = sum(l["qty"] * last[l["coin"]] for l in lots)
+    last = {
+        c: closes[c][-1]
+        for c in coins
+    }
+
+    open_value = sum(
+        l["qty"] * last[l["coin"]]
+        for l in lots
+    )
+
     final = usdc + open_value
 
     for c in coins:
-        c_lots = [l for l in lots if l["coin"] == c]
-        per[c]["unrealized"] = sum(l["qty"] * (last[c] - l["cost"]) for l in c_lots)
-        per[c]["open"] = sum(1 for l in c_lots if l["qty"] * last[c] >= a.min_order)
+        c_lots = [
+            l for l in lots
+            if l["coin"] == c
+        ]
+
+        per[c]["unrealized"] = sum(
+            l["qty"] * (last[c] - l["cost"])
+            for l in c_lots
+        )
+
+        per[c]["open"] = sum(
+            1
+            for l in c_lots
+            if l["qty"] * last[c] >= a.min_order
+        )
 
     return {
-        "buy": buy_usd, "dip": dip, "tp": tp, "int": interval,
-        "ret": (final - a.capital) / a.capital * 100 if a.capital else 0.0,
+        "buy": buy_usd,
+        "dip": dip,
+        "tp": tp,
+        "int": interval,
+        "ret": (
+            (final - a.capital)
+            / a.capital
+            * 100
+            if a.capital
+            else 0.0
+        ),
         "final": final,
         "realized": realized,
-        "unrealized": open_value - sum(l["qty"] * l["cost"] for l in lots),
-        "buys": buys, "sells": sells,
-        "open": sum(1 for l in lots if l["qty"] * last[l["coin"]] >= a.min_order),
+        "unrealized": (
+            open_value
+            - sum(l["qty"] * l["cost"] for l in lots)
+        ),
+        "buys": buys,
+        "sells": sells,
+        "open": sum(
+            1
+            for l in lots
+            if l["qty"] * last[l["coin"]] >= a.min_order
+        ),
         "dd": max_dd,
         "deployed": max_deployed,
         "per": per,
@@ -331,47 +440,806 @@ def simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash
     }
 
 
-def print_report(title, r, a, closes, days):
-    print("=" * 60)
-    print(title)
-    print("=" * 60)
-    print(f"Parametri: BUY ${r['buy']:.0f} | DIP {r['dip']:.1f}% | TP {r['tp']:.1f}% | ciclo ogni {r['int']}h | SELL {a.sell_percent:.0f}%")
-    print(f"Capitale iniziale (equity odierna)  ${a.capital:>10.2f}")
-    print(f"Valore finale                       ${r['final']:>10.2f}   ({r['ret']:+.2f}%)")
-    print(f"  profitto realizzato               ${r['realized']:>10.2f}")
-    print(f"  non realizzato                    ${r['unrealized']:>10.2f}   (lotti ancora aperti)")
-    print(f"Acquisti / vendite                  {r['buys']:>4} / {r['sells']:<4}   lotti aperti: {r['open']}")
-    print(f"BUY segnalati ma saltati (fondi insuff.) {r['missed_buys']:>3}")
-    print(f"Max capitale investito              ${r['deployed']:>10.2f}   -> ritorno sull'investito {(r['final'] - a.capital) / r['deployed'] * 100 if r['deployed'] else 0:+.2f}%")
-    print(f"Max drawdown                         {r['dd']:>10.2f}%")
-    print()
-    print(f"{'coin':<6} {'buy':>5} {'sell':>5} {'realiz.':>9} {'non real.':>10} {'aperti':>7} {'coin nel periodo':>17}")
+def capital_needed(
+    times,
+    closes,
+    highs,
+    buy_usd,
+    dip,
+    tp,
+    interval,
+    a,
+):
+    unlimited = simulate(
+        times,
+        closes,
+        highs,
+        buy_usd,
+        dip,
+        tp,
+        interval,
+        a,
+        unlimited_cash=True,
+    )
 
-    for c, v in r["per"].items():
-        move = (closes[c][-1] / closes[c][23] - 1) * 100 if len(closes[c]) > 23 else 0.0
-        print(f"{c:<6} {v['buys']:>5} {v['sells']:>5} {v['realized']:>9.2f} {v['unrealized']:>10.2f} {v['open']:>7} {move:>+16.1f}%")
-    print("=" * 60, flush=True)
+    required_extra = max(
+        0.0,
+        -unlimited["min_cash"],
+    )
 
-
-def capital_needed(times, closes, highs, buy_usd, dip, tp, interval, a):
-    unlimited = simulate(times, closes, highs, buy_usd, dip, tp, interval, a, unlimited_cash=True)
-    required_extra = max(0.0, -unlimited["min_cash"])
     return a.capital + required_extra
 
 
-def find_capital_for_monthly_target(times, closes, highs, buy_usd, dip, tp, interval, a, target, months):
+# ============================================================
+# ANALISI MERCATO 30 GIORNI
+# ============================================================
+
+def mean_coin_return(closes, start_idx, end_idx):
+    values = []
+
+    for prices in closes.values():
+        if (
+            len(prices) > end_idx
+            and prices[start_idx] > 0
+        ):
+            values.append(
+                (
+                    prices[end_idx]
+                    / prices[start_idx]
+                    - 1
+                )
+                * 100
+            )
+
+    return (
+        statistics.mean(values)
+        if values
+        else 0.0
+    )
+
+
+def market_regime(
+    times,
+    closes,
+    highs,
+    lows,
+    start_idx=None,
+    end_idx=None,
+):
+    if end_idx is None:
+        end_idx = len(times) - 1
+
+    if start_idx is None:
+        start_idx = max(
+            0,
+            end_idx - ANALYSIS_HOURS,
+        )
+
+    returns = []
+    range_positions = []
+    trend_scores = []
+
+    for c in closes:
+        p = closes[c]
+
+        if (
+            start_idx >= len(p)
+            or end_idx >= len(p)
+            or p[start_idx] <= 0
+        ):
+            continue
+
+        ret = (
+            p[end_idx]
+            / p[start_idx]
+            - 1
+        ) * 100
+
+        period_high = max(
+            highs[c][start_idx:end_idx + 1]
+        )
+        period_low = min(
+            lows[c][start_idx:end_idx + 1]
+        )
+
+        if period_high > period_low:
+            position = (
+                p[end_idx] - period_low
+            ) / (
+                period_high - period_low
+            ) * 100
+        else:
+            position = 50.0
+
+        # Confronto seconda metà / prima metà.
+        mid = start_idx + (
+            end_idx - start_idx
+        ) // 2
+
+        first = p[start_idx:mid + 1]
+        second = p[mid:end_idx + 1]
+
+        first_avg = (
+            statistics.mean(first)
+            if first
+            else p[start_idx]
+        )
+        second_avg = (
+            statistics.mean(second)
+            if second
+            else p[end_idx]
+        )
+
+        trend = (
+            (second_avg / first_avg - 1) * 100
+            if first_avg
+            else 0.0
+        )
+
+        returns.append(ret)
+        range_positions.append(position)
+        trend_scores.append(trend)
+
+    avg_return = (
+        statistics.mean(returns)
+        if returns
+        else 0.0
+    )
+
+    avg_position = (
+        statistics.mean(range_positions)
+        if range_positions
+        else 50.0
+    )
+
+    avg_trend = (
+        statistics.mean(trend_scores)
+        if trend_scores
+        else 0.0
+    )
+
+    # Classificazione deliberatamente prudente:
+    # il rendimento è il segnale principale;
+    # posizione nel range e trend fanno da conferma.
+    score = (
+        avg_return
+        + avg_trend * 0.75
+        + (avg_position - 50.0) * 0.025
+    )
+
+    if (
+        avg_return >= 4.0
+        and avg_trend >= 1.0
+    ) or score >= 5.0:
+        regime = "BULLISH"
+    elif (
+        avg_return <= -4.0
+        and avg_trend <= -1.0
+    ) or score <= -5.0:
+        regime = "BEARISH"
+    else:
+        regime = "NEUTRAL"
+
+    return {
+        "regime": regime,
+        "return_pct": avg_return,
+        "position_pct": avg_position,
+        "trend_pct": avg_trend,
+        "score": score,
+        "start": datetime.fromtimestamp(
+            times[start_idx] / 1000,
+            timezone.utc,
+        ).strftime("%Y-%m-%d"),
+        "end": datetime.fromtimestamp(
+            times[end_idx] / 1000,
+            timezone.utc,
+        ).strftime("%Y-%m-%d"),
+    }
+
+
+# ============================================================
+# DIP / TP FISIOLOGICI
+# ============================================================
+
+def physiological_levels(
+    closes,
+    highs,
+    lows,
+    start_idx,
+    end_idx,
+    sell_percent,
+):
+    dips = []
+    tps = []
+
+    for c in closes:
+        p = closes[c]
+
+        if end_idx >= len(p):
+            continue
+
+        # DIP:
+        # drawdown da massimo rolling 24h.
+        # Usiamo il valore massimo osservato in ciascuna
+        # finestra, poi la distribuzione viene sintetizzata
+        # per soglie.
+        for i in range(
+            max(start_idx, 23),
+            end_idx + 1,
+        ):
+            ref = max(
+                highs[c][i - 23:i + 1]
+            )
+
+            if ref > 0:
+                d = (
+                    (ref - p[i])
+                    / ref
+                    * 100
+                )
+
+                if d > 0:
+                    dips.append(d)
+
+        # TP:
+        # recupero dalla minima delle 24h precedenti.
+        for i in range(
+            max(start_idx, 23),
+            end_idx + 1,
+        ):
+            ref = min(
+                lows[c][i - 23:i + 1]
+            )
+
+            if ref > 0:
+                r = (
+                    (p[i] - ref)
+                    / ref
+                    * 100
+                )
+
+                if r > 0:
+                    tps.append(r)
+
+    effective_floor = (
+        (100 / sell_percent * 100) - 100
+        if sell_percent < 100
+        else 0.0
+    )
+
+    tp_floor = max(
+        0.5,
+        effective_floor + 0.1,
+    )
+
+    dip_levels = [
+        x for x in dips
+        if 0.25 <= x <= 15
+    ]
+
+    tp_levels = [
+        x for x in tps
+        if tp_floor <= x <= 20
+    ]
+
+    def summary(values, floor=0.5):
+        if not values:
+            return {
+                "count": 0,
+                "median": None,
+                "p25": None,
+                "p75": None,
+                "mode": None,
+                "frequency": {},
+            }
+
+        # Bin da 0.5%.
+        bins = [
+            round(
+                max(floor, math.floor(v * 2) / 2),
+                1,
+            )
+            for v in values
+        ]
+
+        counter = Counter(bins)
+        mode_value, mode_count = counter.most_common(1)[0]
+
+        total = len(values)
+
+        frequency = {
+            f"{k:.1f}": round(
+                v / total * 100,
+                1,
+            )
+            for k, v in counter.most_common()
+        }
+
+        return {
+            "count": total,
+            "median": round(
+                statistics.median(values),
+                2,
+            ),
+            "p25": round(
+                percentile(values, 25),
+                2,
+            ),
+            "p75": round(
+                percentile(values, 75),
+                2,
+            ),
+            "mode": mode_value,
+            "frequency": frequency,
+            "mode_frequency": round(
+                mode_count / total * 100,
+                1,
+            ),
+        }
+
+    return {
+        "dip": summary(dip_levels, 0.5),
+        "tp": summary(tp_levels, tp_floor),
+    }
+
+
+def percentile(values, p):
+    if not values:
+        return None
+
+    values = sorted(values)
+
+    if len(values) == 1:
+        return values[0]
+
+    k = (len(values) - 1) * p / 100
+    f = math.floor(k)
+    c = math.ceil(k)
+
+    if f == c:
+        return values[int(k)]
+
+    return (
+        values[f]
+        + (values[c] - values[f])
+        * (k - f)
+    )
+
+
+def calendar_months_in_range(times):
+    first = datetime.fromtimestamp(
+        times[0] / 1000,
+        timezone.utc,
+    )
+    last = datetime.fromtimestamp(
+        times[-1] / 1000,
+        timezone.utc,
+    )
+
+    months = []
+
+    y, m = first.year, first.month
+
+    while (y, m) <= (last.year, last.month):
+        months.append(f"{y:04d}-{m:02d}")
+
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+
+    return months
+
+
+def month_indices(times, month):
+    start = None
+    end = None
+
+    for i, ts in enumerate(times):
+        key = datetime.fromtimestamp(
+            ts / 1000,
+            timezone.utc,
+        ).strftime("%Y-%m")
+
+        if key == month:
+            if start is None:
+                start = i
+            end = i
+
+    return start, end
+
+
+# ============================================================
+# STORICO PERSISTENTE
+# ============================================================
+
+def load_history(path):
+    try:
+        if not path.exists():
+            return {}
+
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as f:
+            data = json.load(f)
+
+        return data if isinstance(data, dict) else {}
+
+    except Exception as e:
+        log(f"STORICO | errore lettura {path}: {e}")
+        return {}
+
+
+def save_history(path, history):
+    try:
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        tmp = path.with_suffix(
+            path.suffix + ".tmp"
+        )
+
+        with tmp.open(
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                history,
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        tmp.replace(path)
+
+    except Exception as e:
+        log(f"STORICO | errore salvataggio {path}: {e}")
+
+
+def analyze_historical_months(
+    times,
+    closes,
+    highs,
+    lows,
+    months,
+    sell_percent,
+):
+    records = {}
+
+    for month in months:
+        start, end = month_indices(
+            times,
+            month,
+        )
+
+        if (
+            start is None
+            or end is None
+            or end - start < 72
+        ):
+            continue
+
+        regime = market_regime(
+            times,
+            closes,
+            highs,
+            lows,
+            start,
+            end,
+        )
+
+        levels = physiological_levels(
+            closes,
+            highs,
+            lows,
+            start,
+            end,
+            sell_percent,
+        )
+
+        records[month] = {
+            "regime": regime["regime"],
+            "return_pct": round(
+                regime["return_pct"],
+                2,
+            ),
+            "trend_pct": round(
+                regime["trend_pct"],
+                2,
+            ),
+            "position_pct": round(
+                regime["position_pct"],
+                2,
+            ),
+            "score": round(
+                regime["score"],
+                2,
+            ),
+            "dip": levels["dip"],
+            "tp": levels["tp"],
+        }
+
+    return records
+
+
+def regime_statistics(
+    history,
+    regime,
+    max_months,
+):
+    rows = [
+        (month, record)
+        for month, record in history.items()
+        if record.get("regime") == regime
+    ]
+
+    rows.sort(key=lambda x: x[0])
+
+    if max_months > 0:
+        rows = rows[-max_months:]
+
+    if not rows:
+        return None
+
+    dip_modes = [
+        r["dip"]["mode"]
+        for _, r in rows
+        if r.get("dip", {}).get("mode") is not None
+    ]
+
+    tp_modes = [
+        r["tp"]["mode"]
+        for _, r in rows
+        if r.get("tp", {}).get("mode") is not None
+    ]
+
+    dip_medians = [
+        r["dip"]["median"]
+        for _, r in rows
+        if r.get("dip", {}).get("median") is not None
+    ]
+
+    tp_medians = [
+        r["tp"]["median"]
+        for _, r in rows
+        if r.get("tp", {}).get("median") is not None
+    ]
+
+    def mode_info(values):
+        if not values:
+            return None, 0.0
+
+        rounded = [
+            round(float(v) * 2) / 2
+            for v in values
+        ]
+
+        counter = Counter(rounded)
+        value, count = counter.most_common(1)[0]
+
+        return (
+            value,
+            count / len(rounded) * 100,
+        )
+
+    dip_mode, dip_freq = mode_info(dip_modes)
+    tp_mode, tp_freq = mode_info(tp_modes)
+
+    return {
+        "months": len(rows),
+        "from": rows[0][0],
+        "to": rows[-1][0],
+        "dip_mode": dip_mode,
+        "dip_frequency": round(dip_freq, 1),
+        "tp_mode": tp_mode,
+        "tp_frequency": round(tp_freq, 1),
+        "dip_median": (
+            round(statistics.median(dip_medians), 2)
+            if dip_medians
+            else None
+        ),
+        "tp_median": (
+            round(statistics.median(tp_medians), 2)
+            if tp_medians
+            else None
+        ),
+    }
+
+
+# ============================================================
+# TARGET CONSIGLIATO
+# ============================================================
+
+def suggested_targets(
+    current_regime,
+    current_levels,
+    historical,
+):
+    """
+    Priorità:
+    1. Statistica dei mesi storici dello stesso regime.
+    2. Statistica del mese corrente.
+    3. Fallback prudente sui parametri attuali.
+
+    In BULLISH:
+      DIP leggermente più basso, TP più alto.
+    In BEARISH:
+      DIP più profondo, TP più basso.
+    NEUTRAL:
+      valori centrali.
+    """
+
+    hist = historical
+
+    current_dip = current_levels["dip"]
+    current_tp = current_levels["tp"]
+
+    hist_dip = hist.get("dip_mode")
+    hist_tp = hist.get("tp_mode")
+
+    if hist_dip is None:
+        hist_dip = current_dip.get("mode")
+
+    if hist_tp is None:
+        hist_tp = current_tp.get("mode")
+
+    if hist_dip is None:
+        hist_dip = 2.0
+
+    if hist_tp is None:
+        hist_tp = max(
+            2.0,
+            current_tp.get("mode") or 2.0,
+        )
+
+    if current_regime == "BULLISH":
+        # In un mercato rialzista si vuole comprare
+        # dip relativamente frequenti e lasciare più
+        # spazio al recupero.
+        dip = hist_dip
+        tp = max(
+            hist_tp,
+            current_tp.get("mode") or hist_tp,
+        )
+
+    elif current_regime == "BEARISH":
+        # In un mercato ribassista si evita di comprare
+        # ogni piccolo ribasso e si monetizza recuperi
+        # più contenuti.
+        dip = max(
+            hist_dip,
+            current_dip.get("mode") or hist_dip,
+        )
+        tp = min(
+            hist_tp,
+            current_tp.get("mode") or hist_tp,
+        )
+
+    else:
+        dip = hist_dip
+        tp = hist_tp
+
+    dip = round(
+        max(0.5, min(dip, 10.0)) * 2
+    ) / 2
+
+    tp = round(
+        max(0.5, min(tp, 15.0)) * 2
+    ) / 2
+
+    return {
+        "dip": dip,
+        "tp": tp,
+    }
+
+
+# ============================================================
+# CAPITALE TARGET MENSILE
+# ============================================================
+
+def monthly_median_at_capital(
+    times,
+    closes,
+    highs,
+    buy_usd,
+    dip,
+    tp,
+    interval,
+    a,
+    capital,
+    months,
+):
+    a2 = SimpleNamespace(**vars(a))
+    a2.capital = capital
+
+    r = simulate(
+        times,
+        closes,
+        highs,
+        buy_usd,
+        dip,
+        tp,
+        interval,
+        a2,
+    )
+
+    pnls = [
+        r["monthly_realized"].get(
+            m,
+            0.0,
+        )
+        for m in months
+    ]
+
+    median = (
+        statistics.median(pnls)
+        if pnls
+        else 0.0
+    )
+
+    stdev = (
+        statistics.pstdev(pnls)
+        if len(pnls) > 1
+        else 0.0
+    )
+
+    return median, stdev, r
+
+
+def find_capital_for_monthly_target(
+    times,
+    closes,
+    highs,
+    buy_usd,
+    dip,
+    tp,
+    interval,
+    a,
+    target,
+    months,
+):
     lo = a.capital
-    lo_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, lo, months)
+
+    lo_median, _, _ = monthly_median_at_capital(
+        times,
+        closes,
+        highs,
+        buy_usd,
+        dip,
+        tp,
+        interval,
+        a,
+        lo,
+        months,
+    )
 
     if lo_median >= target:
         return lo, lo_median, True
 
-    hi = max(lo * 2, 50.0)
+    hi = max(
+        lo * 2,
+        50.0,
+    )
+
     prev_median = lo_median
     hi_median = lo_median
 
     for _ in range(12):
-        hi_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, hi, months)
+        hi_median, _, _ = monthly_median_at_capital(
+            times,
+            closes,
+            highs,
+            buy_usd,
+            dip,
+            tp,
+            interval,
+            a,
+            hi,
+            months,
+        )
 
         if hi_median >= target:
             break
@@ -381,424 +1249,873 @@ def find_capital_for_monthly_target(times, closes, highs, buy_usd, dip, tp, inte
 
         prev_median = hi_median
         hi *= 2
+
     else:
         return None, hi_median, False
 
     for _ in range(12):
         mid = (lo + hi) / 2
-        mid_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, mid, months)
+
+        mid_median, _, _ = monthly_median_at_capital(
+            times,
+            closes,
+            highs,
+            buy_usd,
+            dip,
+            tp,
+            interval,
+            a,
+            mid,
+            months,
+        )
 
         if mid_median >= target:
             hi = mid
         else:
             lo = mid
 
-    final_median, _, _ = monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, hi, months)
+    final_median, _, _ = monthly_median_at_capital(
+        times,
+        closes,
+        highs,
+        buy_usd,
+        dip,
+        tp,
+        interval,
+        a,
+        hi,
+        months,
+    )
 
     return hi, final_median, True
 
 
 # ============================================================
-# SERVIZIO & CONFIGURAZIONE
+# CAPITALE REALE
 # ============================================================
 
-load_dotenv()
-
-sys.stdout.reconfigure(line_buffering=True)
-
-COINS = [c.strip().upper() for c in os.getenv("COINS", "HYPE,ZEC,ETH,SOL").split(",") if c.strip()]
-LOOP_INTERVAL_SECONDS = int(os.getenv("LOOP_INTERVAL_SECONDS", "14400"))
-BUY_USD = float(os.getenv("BUY_USD", "10"))
-
-CURRENT_DIP_PERCENT = float(os.getenv("DIP_PERCENT", "2.0"))
-CURRENT_TP_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "4.0"))
-
-SELL_PERCENT = float(os.getenv("SELL_PERCENT", "95"))
-MIN_ORDER_USD = float(os.getenv("MIN_ORDER_USD", "10"))
-
-BACKTEST_DAYS = min(int(os.getenv("BACKTEST_DAYS", "200")), 208)
-
-TARGET_MONTHLY_PROFIT = float(os.getenv("TARGET_MONTHLY_PROFIT", "30"))
-GRID_SIZE = int(os.getenv("GRID_SIZE", "8"))
-
-ACCOUNT_ADDRESS = (
-    os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
-    or os.getenv("HL_ACCOUNT_ADDRESS")
-    or os.getenv("ACCOUNT_ADDRESS")
-)
-
-CAPITAL_EXTRA_COINS = [c.strip().upper() for c in os.getenv("CAPITAL_EXTRA_COINS", "").split(",") if c.strip()]
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-args = SimpleNamespace(
-    capital=float(os.getenv("BACKTEST_CAPITAL", "1000")),
-    sell_percent=SELL_PERCENT,
-    max_position=float(os.getenv("MAX_POSITION_USD", "200")),
-    weekly_buys=int(os.getenv("MAX_WEEKLY_BUYS", "10")),
-    min_order=MIN_ORDER_USD,
-    fee=float(os.getenv("BACKTEST_FEE", "0.0007")),
-    slippage=float(os.getenv("BACKTEST_SLIPPAGE", "0.0005")),
-)
-
-
-def log(message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now}] {message}", flush=True)
-
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-            timeout=10
-        )
-    except Exception as e:
-        log(f"TELEGRAM ERRORE | {e}")
-
-
-def get_real_capital(coins, last_prices, info, meta):
-    user_state = _with_retry(info.spot_user_state, ACCOUNT_ADDRESS)
+def get_real_capital(
+    coins,
+    last_prices,
+    info,
+    meta,
+):
+    user_state = _with_retry(
+        info.spot_user_state,
+        ACCOUNT_ADDRESS,
+    )
 
     extra_prices = {}
 
     if CAPITAL_EXTRA_COINS:
-        usdc_idx = next(i for i, t in enumerate(meta["tokens"]) if t["name"] == "USDC")
+        usdc_idx = next(
+            i
+            for i, t in enumerate(meta["tokens"])
+            if t["name"] == "USDC"
+        )
 
         for coin in CAPITAL_EXTRA_COINS:
             found_token = False
 
-            for idx, token in enumerate(meta["tokens"]):
-                if token["name"] in (coin, "U" + coin):
+            for idx, token in enumerate(
+                meta["tokens"]
+            ):
+                if token["name"] in (
+                    coin,
+                    "U" + coin,
+                ):
                     found_token = True
 
-                    market = next((m["name"] for m in meta["universe"] if m["tokens"] == [idx, usdc_idx]), None)
+                    market = next(
+                        (
+                            m["name"]
+                            for m in meta["universe"]
+                            if m["tokens"]
+                            == [idx, usdc_idx]
+                        ),
+                        None,
+                    )
 
                     if not market:
-                        log(f"CAPITALE REALE | {coin}: token trovato ma nessun mercato spot {coin}/USDC")
+                        log(
+                            f"CAPITALE REALE | {coin}: "
+                            f"nessun mercato spot"
+                        )
                         break
 
-                    book = _with_retry(info.l2_snapshot, market)
-                    levels = book.get("levels", [])
+                    book = _with_retry(
+                        info.l2_snapshot,
+                        market,
+                    )
 
-                    if len(levels) == 2 and levels[0] and levels[1]:
-                        extra_prices[coin] = (float(levels[0][0]["px"]) + float(levels[1][0]["px"])) / 2
-                    else:
-                        log(f"CAPITALE REALE | {coin}: orderbook {market} vuoto o non disponibile")
+                    levels = book.get(
+                        "levels",
+                        [],
+                    )
+
+                    if (
+                        len(levels) == 2
+                        and levels[0]
+                        and levels[1]
+                    ):
+                        extra_prices[coin] = (
+                            float(levels[0][0]["px"])
+                            + float(levels[1][0]["px"])
+                        ) / 2
 
                     break
 
             if not found_token:
-                log(f"CAPITALE REALE | {coin}: nessun token '{coin}' o 'U{coin}' nei metadata Spot")
+                log(
+                    f"CAPITALE REALE | {coin}: "
+                    f"token non trovato"
+                )
 
     usdc_balance = 0.0
     coins_value = 0.0
     extra_value = 0.0
 
-    for balance in user_state.get("balances", []):
+    for balance in user_state.get(
+        "balances",
+        [],
+    ):
         name = balance.get("coin")
-        total = float(balance.get("total", 0) or 0)
+        total = float(
+            balance.get("total", 0)
+            or 0
+        )
 
         if name == "USDC":
             usdc_balance = total
             continue
 
+        handled = False
+
         for coin in coins:
-            if name in (coin, "U" + coin) and coin in last_prices:
-                coins_value += total * last_prices[coin]
+            if (
+                name in (
+                    coin,
+                    "U" + coin,
+                )
+                and coin in last_prices
+            ):
+                coins_value += (
+                    total * last_prices[coin]
+                )
+                handled = True
                 break
-        else:
-            for coin in CAPITAL_EXTRA_COINS:
-                if name in (coin, "U" + coin) and coin in extra_prices:
-                    extra_value += total * extra_prices[coin]
-                    break
 
-    log(f"CAPITALE REALE | USDC ${usdc_balance:.2f} + coin gestite ${coins_value:.2f} + coin extra ${extra_value:.2f} = ${usdc_balance + coins_value + extra_value:.2f}")
+        if handled:
+            continue
 
-    return usdc_balance + coins_value + extra_value
+        for coin in CAPITAL_EXTRA_COINS:
+            if (
+                name in (
+                    coin,
+                    "U" + coin,
+                )
+                and coin in extra_prices
+            ):
+                extra_value += (
+                    total * extra_prices[coin]
+                )
+                break
 
+    total_capital = (
+        usdc_balance
+        + coins_value
+        + extra_value
+    )
 
-def _percentile_grid(values, floor=0.0):
-    if not values:
-        return [max(floor, x) for x in [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]][:GRID_SIZE]
+    log(
+        f"CAPITALE REALE | USDC "
+        f"${usdc_balance:.2f} + coin gestite "
+        f"${coins_value:.2f} + coin extra "
+        f"${extra_value:.2f} = "
+        f"${total_capital:.2f}"
+    )
 
-    values = sorted(values)
-    n = len(values)
-
-    percentiles = [round(40 + i * (98.5 - 40) / (GRID_SIZE - 1), 1) for i in range(GRID_SIZE)]
-
-    grid = []
-
-    for p in percentiles:
-        idx = min(int(n * p / 100), n - 1)
-        grid.append(round(values[idx] * 2) / 2)
-
-    seen = set()
-    out = []
-
-    for v in grid:
-        v = max(floor, v)
-
-        if v not in seen:
-            seen.add(v)
-            out.append(v)
-
-    return sorted(out)
-
-
-def build_dip_grid(closes, highs):
-    drops = []
-
-    for c, cl in closes.items():
-        hi = highs[c]
-
-        for i in range(23, len(cl)):
-            h24 = max(hi[i - 23:i + 1])
-
-            if h24 > 0:
-                d = (h24 - cl[i]) / h24 * 100
-
-                if d > 0:
-                    drops.append(d)
-
-    return _percentile_grid(drops, floor=0.5)
-
-
-def build_tp_grid(closes):
-    rises = []
-
-    for c, cl in closes.items():
-        for i in range(23, len(cl)):
-            low24 = min(cl[i - 23:i + 1])
-
-            if low24 > 0:
-                r = (cl[i] - low24) / low24 * 100
-
-                if r > 0:
-                    rises.append(r)
-
-    effective_floor = (100 / SELL_PERCENT * 100 - 100) if SELL_PERCENT < 100 else 0.0
-    floor = max(0.5, round((effective_floor + 0.3) * 2) / 2)
-
-    return _percentile_grid(rises, floor=floor)
-
-
-def calendar_months_in_range(times):
-    first = datetime.fromtimestamp(times[0] / 1000, timezone.utc)
-    last = datetime.fromtimestamp(times[-1] / 1000, timezone.utc)
-
-    months = []
-    y, m = first.year, first.month
-
-    while (y, m) <= (last.year, last.month):
-        months.append(f"{y:04d}-{m:02d}")
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-
-    return months
-
-
-def monthly_median_at_capital(times, closes, highs, buy_usd, dip, tp, interval, a, capital, months):
-    a2 = SimpleNamespace(**vars(a))
-    a2.capital = capital
-
-    r = simulate(times, closes, highs, buy_usd, dip, tp, interval, a2)
-    pnls = monthly_pnls(r, months)
-
-    median = statistics.median(pnls)
-    stdev = statistics.pstdev(pnls) if len(pnls) > 1 else 0.0
-
-    return median, stdev, r
-
-
-def monthly_pnls(result, months):
-    mr = result["monthly_realized"]
-    return [mr.get(m, 0.0) for m in months]
-
-
-def find_target_param(label, times, closes, highs, candidates, months, sim_fn, target, results):
-    print(f"\nRICERCA {label} PER OBIETTIVO ~${target:.0f}/MESE (mediana su {len(months)} mesi di calendario)")
-    print("-" * 70)
-    print(f"{label:<8} {'mediana €/mese':>15} {'dev.std':>10} {'scarto da target':>18} {'rendimento tot.':>16}")
-
-    scored = []
-
-    for v in candidates:
-        r = sim_fn(times, closes, highs, v)
-        pnls = monthly_pnls(r, months)
-
-        median = statistics.median(pnls)
-        stdev = statistics.pstdev(pnls) if len(pnls) > 1 else 0.0
-        diff = abs(median - target)
-
-        scored.append((diff, stdev, v, r, median))
-
-        print(f"{v:>6.1f}% {median:>15.2f} {stdev:>10.2f} {diff:>18.2f} {r['ret']:>15.2f}%")
-
-    scored.sort(key=lambda x: (x[0], x[1]))
-
-    best_diff, best_stdev, best_v, best_r, best_median = scored[0]
-
-    print(f"\n-> {label} PIU' VICINO ALL'OBIETTIVO: {best_v:.1f}% (mediana ${best_median:.2f}/mese, scarto ${best_diff:.2f}, dev.std ${best_stdev:.2f})\n")
-
-    return best_v, best_r, best_median, best_stdev
+    return total_capital
 
 
 # ============================================================
-# CACHE E STORICO IN MEMORIA
+# REPORT / TELEGRAM
 # ============================================================
+
+def print_report(
+    title,
+    r,
+    a,
+    closes,
+):
+    print("=" * 68)
+    print(title)
+    print("=" * 68)
+
+    print(
+        f"BUY ${r['buy']:.0f} | "
+        f"DIP {r['dip']:.1f}% | "
+        f"TP {r['tp']:.1f}% | "
+        f"ciclo {r['int']}h"
+    )
+
+    print(
+        f"Capitale iniziale     ${a.capital:>10.2f}"
+    )
+    print(
+        f"Valore finale         ${r['final']:>10.2f} "
+        f"({r['ret']:+.2f}%)"
+    )
+    print(
+        f"Profitto realizzato   ${r['realized']:>10.2f}"
+    )
+    print(
+        f"Non realizzato        ${r['unrealized']:>10.2f}"
+    )
+    print(
+        f"BUY / SELL             "
+        f"{r['buys']:>5} / {r['sells']:<5}"
+    )
+    print(
+        f"BUY saltati            "
+        f"{r['missed_buys']:>5}"
+    )
+    print(
+        f"Max capitale investito "
+        f"${r['deployed']:>9.2f}"
+    )
+    print(
+        f"Max drawdown            "
+        f"{r['dd']:>8.2f}%"
+    )
+
+    print("-" * 68)
+
+    for c, v in r["per"].items():
+        move = (
+            (
+                closes[c][-1]
+                / closes[c][0]
+                - 1
+            ) * 100
+            if closes[c][0]
+            else 0
+        )
+
+        print(
+            f"{c:<7} "
+            f"BUY {v['buys']:>4} "
+            f"SELL {v['sells']:>4} "
+            f"real. ${v['realized']:>8.2f} "
+            f"move {move:+7.2f}%"
+        )
+
+    print("=" * 68)
+
+
+def send_telegram(message):
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+        return
+
+    try:
+        requests.post(
+            "https://api.telegram.org/"
+            f"bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log(
+            f"TELEGRAM ERRORE | {e}"
+        )
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+load_dotenv()
+
+sys.stdout.reconfigure(
+    line_buffering=True
+)
+
+COINS = [
+    c.strip().upper()
+    for c in os.getenv(
+        "COINS",
+        "HYPE,ZEC,ETH,SOL",
+    ).split(",")
+    if c.strip()
+]
+
+LOOP_INTERVAL_SECONDS = int(
+    os.getenv(
+        "LOOP_INTERVAL_SECONDS",
+        "14400",
+    )
+)
+
+BUY_USD = float(
+    os.getenv(
+        "BUY_USD",
+        "10",
+    )
+)
+
+CURRENT_DIP_PERCENT = float(
+    os.getenv(
+        "DIP_PERCENT",
+        "2.0",
+    )
+)
+
+CURRENT_TP_PERCENT = float(
+    os.getenv(
+        "TAKE_PROFIT_PERCENT",
+        "4.0",
+    )
+)
+
+SELL_PERCENT = float(
+    os.getenv(
+        "SELL_PERCENT",
+        "95",
+    )
+)
+
+MIN_ORDER_USD = float(
+    os.getenv(
+        "MIN_ORDER_USD",
+        "10",
+    )
+)
+
+BACKTEST_DAYS = min(
+    int(
+        os.getenv(
+            "BACKTEST_DAYS",
+            "200",
+        )
+    ),
+    208,
+)
+
+TARGET_MONTHLY_PROFIT = float(
+    os.getenv(
+        "TARGET_MONTHLY_PROFIT",
+        "30",
+    )
+)
+
+HISTORY_FILE = Path(
+    os.getenv(
+        "HISTORY_FILE",
+        "/data/market_history.json",
+    )
+)
+
+HISTORY_MONTHS = int(
+    os.getenv(
+        "HISTORY_MONTHS",
+        "24",
+    )
+)
+
+ACCOUNT_ADDRESS = (
+    os.getenv(
+        "HYPERLIQUID_ACCOUNT_ADDRESS"
+    )
+    or os.getenv(
+        "HL_ACCOUNT_ADDRESS"
+    )
+    or os.getenv(
+        "ACCOUNT_ADDRESS"
+    )
+)
+
+CAPITAL_EXTRA_COINS = [
+    c.strip().upper()
+    for c in os.getenv(
+        "CAPITAL_EXTRA_COINS",
+        "",
+    ).split(",")
+    if c.strip()
+]
+
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID"
+)
+
+args = SimpleNamespace(
+    capital=float(
+        os.getenv(
+            "BACKTEST_CAPITAL",
+            "1000",
+        )
+    ),
+    sell_percent=SELL_PERCENT,
+    max_position=float(
+        os.getenv(
+            "MAX_POSITION_USD",
+            "200",
+        )
+    ),
+    weekly_buys=int(
+        os.getenv(
+            "MAX_WEEKLY_BUYS",
+            "10",
+        )
+    ),
+    min_order=MIN_ORDER_USD,
+    fee=float(
+        os.getenv(
+            "BACKTEST_FEE",
+            "0.0007",
+        )
+    ),
+    slippage=float(
+        os.getenv(
+            "BACKTEST_SLIPPAGE",
+            "0.0005",
+        )
+    ),
+)
 
 DATA_CACHE = None
 INFO_CACHE = None
 META_CACHE = None
 
-DIP_HISTORY = []
-TP_HISTORY = []
 
-HISTORY_MAX = int(os.getenv("HISTORY_MAX", "200"))
-STABILITY_MIN_SAMPLES = int(os.getenv("STABILITY_MIN_SAMPLES", "5"))
-STABILITY_BAND = float(os.getenv("STABILITY_BAND", "1.0"))
+def log(message):
+    now = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    print(
+        f"[{now}] {message}",
+        flush=True,
+    )
 
 
 # ============================================================
-# RUNNER PRINCIPALE DEL CICLO
+# RUN
 # ============================================================
 
 def run():
-    global DATA_CACHE, INFO_CACHE, META_CACHE, DIP_HISTORY, TP_HISTORY
+    global DATA_CACHE
+    global INFO_CACHE
+    global META_CACHE
 
-    log("============================================================")
-    log("AVVIO NUOVO CICLO DI BACKTEST")
-    log("============================================================")
+    log("=" * 68)
+    log("AVVIO NUOVO CICLO")
+    log("=" * 68)
 
     from hyperliquid.info import Info
     from hyperliquid.utils import constants
 
     if INFO_CACHE is None:
-        INFO_CACHE = Info(constants.MAINNET_API_URL, skip_ws=True)
+        INFO_CACHE = Info(
+            constants.MAINNET_API_URL,
+            skip_ws=True,
+        )
 
     if META_CACHE is None:
-        META_CACHE = _with_retry(INFO_CACHE.spot_meta)
+        META_CACHE = _with_retry(
+            INFO_CACHE.spot_meta
+        )
 
-    log(f"Download/Aggiornamento candele 1h per {COINS} sugli ultimi {BACKTEST_DAYS} giorni...")
     DATA_CACHE = fetch_candles(
-        COINS, BACKTEST_DAYS, existing_data=DATA_CACHE, info=INFO_CACHE, meta=META_CACHE
+        COINS,
+        BACKTEST_DAYS,
+        existing_data=DATA_CACHE,
+        info=INFO_CACHE,
+        meta=META_CACHE,
     )
 
-    times, closes, highs = align(DATA_CACHE)
-    months = calendar_months_in_range(times)
-    num_months = len(months)
+    times, closes, highs, lows = align(
+        DATA_CACHE
+    )
 
-    last_prices = {c: closes[c][-1] for c in COINS}
+    months = calendar_months_in_range(
+        times
+    )
+
+    last_prices = {
+        c: closes[c][-1]
+        for c in closes
+    }
 
     if ACCOUNT_ADDRESS:
         try:
-            real_cap = get_real_capital(COINS, last_prices, INFO_CACHE, META_CACHE)
-            args.capital = real_cap
+            args.capital = get_real_capital(
+                COINS,
+                last_prices,
+                INFO_CACHE,
+                META_CACHE,
+            )
         except Exception as e:
-            log(f"ATTENZIONE: Errore lettura capitale reale dal conto ({e}). Uso default ${args.capital:.2f}")
-            traceback.print_exc()
+            log(
+                f"ATTENZIONE capitale reale: "
+                f"{e}"
+            )
 
-    log(f"Capitale di partenza simulato: ${args.capital:.2f}")
+    # --------------------------------------------------------
+    # A. PARAMETRI ATTUALI
+    # --------------------------------------------------------
 
-    # ============================================================
-    # 1) PARAMETRI ATTUALI
-    # ============================================================
-    log("\n1) SIMULAZIONE PARAMETRI ATTUALI DEL BOT...")
     current_result = simulate(
-        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, 1, args
+        times,
+        closes,
+        highs,
+        BUY_USD,
+        CURRENT_DIP_PERCENT,
+        CURRENT_TP_PERCENT,
+        1,
+        args,
     )
+
     current_required = capital_needed(
-        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, 1, args
-    )
-
-    cap_for_30_curr, _, reach_curr = find_capital_for_monthly_target(
-        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, 1, args, TARGET_MONTHLY_PROFIT, months
-    )
-
-    print_report("PARAMETRI ATTUALI DEL BOT", current_result, args, closes, BACKTEST_DAYS)
-
-    # ============================================================
-    # 2) ANALISI ESPLORATIVA & SOGLIE FREQUENTI
-    # ============================================================
-    log("\n2) ANALISI ESPLORATIVA DIP E TP SU OBIETTIVO MENSILE...")
-    dip_grid = build_dip_grid(closes, highs)
-    tp_grid = build_tp_grid(closes)
-
-    best_dip, dip_r, dip_median, dip_stdev = find_target_param(
-        "DIP",
         times,
         closes,
         highs,
-        dip_grid,
-        months,
-        lambda t, c, h, v: simulate(t, c, h, BUY_USD, v, CURRENT_TP_PERCENT, 1, args),
-        TARGET_MONTHLY_PROFIT,
-        results={},
+        BUY_USD,
+        CURRENT_DIP_PERCENT,
+        CURRENT_TP_PERCENT,
+        1,
+        args,
     )
 
-    best_tp, combined_r, combined_median, combined_stdev = find_target_param(
-        "TP",
+    # --------------------------------------------------------
+    # B. ANALISI ULTIMI 30 GIORNI
+    # --------------------------------------------------------
+
+    current_start = max(
+        0,
+        len(times) - ANALYSIS_HOURS,
+    )
+
+    current_regime = market_regime(
         times,
         closes,
         highs,
-        tp_grid,
+        lows,
+        current_start,
+        len(times) - 1,
+    )
+
+    current_levels = physiological_levels(
+        closes,
+        highs,
+        lows,
+        current_start,
+        len(times) - 1,
+        SELL_PERCENT,
+    )
+
+    log(
+        f"REGIME 30G | "
+        f"{current_regime['regime']} | "
+        f"rendimento {current_regime['return_pct']:+.2f}% | "
+        f"trend {current_regime['trend_pct']:+.2f}% | "
+        f"range-pos {current_regime['position_pct']:.1f}%"
+    )
+
+    log(
+        f"30G FISIOLOGICO | "
+        f"DIP mode {current_levels['dip']['mode']}% "
+        f"freq {current_levels['dip']['mode_frequency']}% | "
+        f"TP mode {current_levels['tp']['mode']}% "
+        f"freq {current_levels['tp']['mode_frequency']}%"
+    )
+
+    # --------------------------------------------------------
+    # C. ANALISI STORICA MESE PER MESE
+    # --------------------------------------------------------
+
+    new_month_records = analyze_historical_months(
+        times,
+        closes,
+        highs,
+        lows,
         months,
-        lambda t, c, h, v: simulate(t, c, h, BUY_USD, best_dip, v, 1, args),
-        TARGET_MONTHLY_PROFIT,
-        results={},
+        SELL_PERCENT,
     )
 
-    cap_for_30_best, _, reach_best = find_capital_for_monthly_target(
-        times, closes, highs, BUY_USD, best_dip, best_tp, 1, args, TARGET_MONTHLY_PROFIT, months
+    history = load_history(
+        HISTORY_FILE
     )
 
-    DIP_HISTORY.append(best_dip)
-    TP_HISTORY.append(best_tp)
-    if len(DIP_HISTORY) > HISTORY_MAX:
-        DIP_HISTORY.pop(0)
-        TP_HISTORY.pop(0)
+    # Aggiorna i mesi già esistenti.
+    for month, record in new_month_records.items():
+        history[month] = record
 
-    mode_dip = Counter(DIP_HISTORY).most_common(1)[0][0]
-    mode_tp = Counter(TP_HISTORY).most_common(1)[0][0]
+    # Limite storico.
+    all_months = sorted(history.keys())
+    if HISTORY_MONTHS > 0:
+        for old_month in all_months[:-HISTORY_MONTHS]:
+            del history[old_month]
 
-    n_samples = len(DIP_HISTORY)
-    freq_dip = (sum(1 for x in DIP_HISTORY if abs(x - mode_dip) <= STABILITY_BAND) / n_samples) * 100
-    freq_tp = (sum(1 for x in TP_HISTORY if abs(x - mode_tp) <= STABILITY_BAND) / n_samples) * 100
+    save_history(
+        HISTORY_FILE,
+        history,
+    )
 
-    if n_samples < STABILITY_MIN_SAMPLES:
-        suggestion = "In raccolta dati (pochi cicli per suggerire modifiche)."
-    elif (mode_dip != CURRENT_DIP_PERCENT or mode_tp != CURRENT_TP_PERCENT) and (freq_dip >= 60 and freq_tp >= 60):
-        suggestion = f"CONSIGLIATO CAMBIO -> DIP {mode_dip:.1f}% / TP {mode_tp:.1f}% (stabili al {freq_dip:.0f}%)."
-    elif mode_dip == CURRENT_DIP_PERCENT and mode_tp == CURRENT_TP_PERCENT:
-        suggestion = "Mantenere parametri attuali (coincidono con la moda storica)."
+    hist_stats = regime_statistics(
+        history,
+        current_regime["regime"],
+        HISTORY_MONTHS,
+    )
+
+    if hist_stats is None:
+        hist_stats = {
+            "months": 0,
+            "from": None,
+            "to": None,
+            "dip_mode": None,
+            "dip_frequency": 0.0,
+            "tp_mode": None,
+            "tp_frequency": 0.0,
+            "dip_median": None,
+            "tp_median": None,
+        }
+
+    # --------------------------------------------------------
+    # D. TARGET CONSIGLIATI
+    # --------------------------------------------------------
+
+    suggested = suggested_targets(
+        current_regime["regime"],
+        current_levels,
+        hist_stats,
+    )
+
+    target_changed = (
+        abs(
+            suggested["dip"]
+            - CURRENT_DIP_PERCENT
+        ) >= 0.5
+        or abs(
+            suggested["tp"]
+            - CURRENT_TP_PERCENT
+        ) >= 0.5
+    )
+
+    if hist_stats["months"] < 2:
+        suggestion = (
+            "RACCOLTA DATI: storico insufficiente"
+        )
+    elif not target_changed:
+        suggestion = (
+            f"MANTENERE DIP "
+            f"{CURRENT_DIP_PERCENT:.1f}% / "
+            f"TP {CURRENT_TP_PERCENT:.1f}%"
+        )
     else:
-        suggestion = "Parametri variabili tra i cicli: consiglia di mantenere gli attuali per stabilità."
+        suggestion = (
+            f"CAMBIO SUGGERITO -> DIP "
+            f"{suggested['dip']:.1f}% / "
+            f"TP {suggested['tp']:.1f}%"
+        )
 
-    # ============================================================
-    # 3) MESSAGGIO TELEGRAM SINTETICO
-    # ============================================================
-    cap_curr_txt = f"${cap_for_30_curr:.0f}" if (reach_curr and cap_for_30_curr) else "N/D (limite bot)"
-    cap_best_txt = f"${cap_for_30_best:.0f}" if (reach_best and cap_for_30_best) else "N/D (limite bot)"
+    # --------------------------------------------------------
+    # E. CAPITALE CON TARGET SUGGERITI
+    # --------------------------------------------------------
 
-    tg_msg = (
-        f"Backtest {num_months} mesi | capitale ${args.capital:.2f}\n\n"
-        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}%/TP {CURRENT_TP_PERCENT:.1f}% -> profitto {BACKTEST_DAYS}gg: ${current_result['realized']:+.2f}\n"
-        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese: {cap_curr_txt} (req. reale: ${current_required:.2f})\n\n"
-        f"Più frequente: DIP {mode_dip:.1f}%/TP {mode_tp:.1f}% (ottimale ciclo: DIP {best_dip:.1f}%/TP {best_tp:.1f}%)\n"
-        f"Capitale x ${TARGET_MONTHLY_PROFIT:.0f}/mese (con target ottimali): {cap_best_txt}\n\n"
-        f"Suggerimento: {suggestion}"
+    cap_curr, _, reach_curr = (
+        find_capital_for_monthly_target(
+            times,
+            closes,
+            highs,
+            BUY_USD,
+            CURRENT_DIP_PERCENT,
+            CURRENT_TP_PERCENT,
+            1,
+            args,
+            TARGET_MONTHLY_PROFIT,
+            months,
+        )
     )
 
-    send_telegram(tg_msg)
-    log(f"\n[TELEGRAM INVIATO]\n{tg_msg}")
+    cap_suggested, _, reach_suggested = (
+        find_capital_for_monthly_target(
+            times,
+            closes,
+            highs,
+            BUY_USD,
+            suggested["dip"],
+            suggested["tp"],
+            1,
+            args,
+            TARGET_MONTHLY_PROFIT,
+            months,
+        )
+    )
+
+    # --------------------------------------------------------
+    # F. REPORT LOG
+    # --------------------------------------------------------
+
+    print_report(
+        "PARAMETRI ATTUALI",
+        current_result,
+        args,
+        closes,
+    )
+
+    print("\n" + "=" * 68)
+    print("ANALISI MERCATO 30 GIORNI")
+    print("=" * 68)
+
+    print(
+        f"Periodo: "
+        f"{current_regime['start']} -> "
+        f"{current_regime['end']}"
+    )
+
+    print(
+        f"REGIME: {current_regime['regime']}"
+    )
+
+    print(
+        f"Rendimento medio: "
+        f"{current_regime['return_pct']:+.2f}%"
+    )
+
+    print(
+        f"Trend seconda metà: "
+        f"{current_regime['trend_pct']:+.2f}%"
+    )
+
+    print(
+        f"Posizione nel range: "
+        f"{current_regime['position_pct']:.1f}%"
+    )
+
+    print(
+        f"Score: "
+        f"{current_regime['score']:+.2f}"
+    )
+
+    print(
+        f"DIP fisiologico: "
+        f"mode {current_levels['dip']['mode']}% | "
+        f"mediana {current_levels['dip']['median']}% | "
+        f"P25/P75 "
+        f"{current_levels['dip']['p25']}/"
+        f"{current_levels['dip']['p75']}%"
+    )
+
+    print(
+        f"TP fisiologico: "
+        f"mode {current_levels['tp']['mode']}% | "
+        f"mediana {current_levels['tp']['median']}% | "
+        f"P25/P75 "
+        f"{current_levels['tp']['p25']}/"
+        f"{current_levels['tp']['p75']}%"
+    )
+
+    print("\n" + "=" * 68)
+    print(
+        f"STORICO {current_regime['regime']}"
+    )
+    print("=" * 68)
+
+    print(
+        f"Mesi considerati: "
+        f"{hist_stats['months']}"
+    )
+
+    if hist_stats["months"]:
+        print(
+            f"DIP storico più frequente: "
+            f"{hist_stats['dip_mode']:.1f}% "
+            f"({hist_stats['dip_frequency']:.0f}% dei mesi)"
+        )
+
+        print(
+            f"TP storico più frequente: "
+            f"{hist_stats['tp_mode']:.1f}% "
+            f"({hist_stats['tp_frequency']:.0f}% dei mesi)"
+        )
+
+        print(
+            f"DIP mediano dei mesi: "
+            f"{hist_stats['dip_median']:.2f}%"
+        )
+
+        print(
+            f"TP mediano dei mesi: "
+            f"{hist_stats['tp_median']:.2f}%"
+        )
+
+    print(
+        f"\nTARGET SUGGERITI: "
+        f"DIP {suggested['dip']:.1f}% / "
+        f"TP {suggested['tp']:.1f}%"
+    )
+
+    print(
+        f"SUGGERIMENTO: {suggestion}"
+    )
+
+    # --------------------------------------------------------
+    # G. TELEGRAM
+    # --------------------------------------------------------
+
+    cap_curr_txt = (
+        f"${cap_curr:.0f}"
+        if reach_curr and cap_curr
+        else "N/D"
+    )
+
+    cap_suggested_txt = (
+        f"${cap_suggested:.0f}"
+        if reach_suggested and cap_suggested
+        else "N/D"
+    )
+
+    tg = (
+        f"30G: {current_regime['regime']} "
+        f"{current_regime['return_pct']:+.1f}%\n"
+        f"DIP fisiologico: "
+        f"{current_levels['dip']['mode']}% | "
+        f"TP: {current_levels['tp']['mode']}%\n\n"
+        f"Storico {current_regime['regime']}: "
+        f"{hist_stats['months']} mesi\n"
+        f"DIP: "
+        f"{hist_stats['dip_mode'] if hist_stats['dip_mode'] is not None else 'N/D'}% | "
+        f"TP: "
+        f"{hist_stats['tp_mode'] if hist_stats['tp_mode'] is not None else 'N/D'}%\n\n"
+        f"Attuale: "
+        f"DIP {CURRENT_DIP_PERCENT:.1f}% / "
+        f"TP {CURRENT_TP_PERCENT:.1f}%\n"
+        f"Suggerito: "
+        f"DIP {suggested['dip']:.1f}% / "
+        f"TP {suggested['tp']:.1f}%\n\n"
+        f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
+        f"attuale {cap_curr_txt} | "
+        f"suggerito {cap_suggested_txt}\n\n"
+        f"{suggestion}"
+    )
+
+    send_telegram(tg)
+
+    log(
+        f"\n[TELEGRAM]\n{tg}"
+    )
 
 
 # ============================================================
@@ -806,13 +2123,25 @@ def run():
 # ============================================================
 
 if __name__ == "__main__":
-    log("Servizio Backtest Avviato...")
+    log(
+        "Servizio Backtest/Market Analyzer avviato..."
+    )
+
     while True:
         try:
             run()
+
         except Exception as e:
-            log(f"ERRORE NEL CICLO DI BACKTEST: {e}")
+            log(
+                f"ERRORE NEL CICLO: {e}"
+            )
             traceback.print_exc()
 
-        log(f"In attesa del prossimo ciclo tra {LOOP_INTERVAL_SECONDS} secondi...")
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        log(
+            f"Prossimo ciclo tra "
+            f"{LOOP_INTERVAL_SECONDS} secondi..."
+        )
+
+        time.sleep(
+            LOOP_INTERVAL_SECONDS
+        )
