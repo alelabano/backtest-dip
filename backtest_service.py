@@ -318,9 +318,8 @@ def simulate(
                     for l in open_lots
                 )
             else:
-                reference = max(
-                    highs[c][i - 23:i + 1]
-                )
+                sub_highs = highs[c][max(0, i - 23) : i + 1]
+                reference = max(sub_highs) if sub_highs else px[c]
 
             if reference > 0:
                 drop = (
