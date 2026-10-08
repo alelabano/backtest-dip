@@ -3,7 +3,7 @@ BACKTEST / MARKET REGIME ANALYZER - Hyperliquid Spot
 
 Logica:
 1) Simula i parametri attuali del bot.
-2) Analizza gli ultimi 30 giorni per classificare il mercato:
+2) Analizza gli ultimi 200 giorni con candele 4H:
    BULLISH / BEARISH / NEUTRAL.
 3) Misura DIP e TP fisiologici osservati nel periodo.
 4) Confronta il mese corrente con i mesi storici dello stesso regime.
@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 HOUR_MS = 3600 * 1000
 CANDLE_INTERVAL = "4h"
 CANDLES_PER_DAY = 6
-ANALYSIS_DAYS = 30
+ANALYSIS_DAYS = 200
 ANALYSIS_CANDLES = ANALYSIS_DAYS * CANDLES_PER_DAY
 
 # Event detection on 4H candles.
@@ -318,8 +318,9 @@ def simulate(
                     for l in open_lots
                 )
             else:
-                sub_highs = highs[c][max(0, i - 23) : i + 1]
-                reference = max(sub_highs) if sub_highs else px[c]
+                reference = max(
+                    highs[c][max(0, i - CANDLES_PER_DAY + 1):i + 1]
+                )
 
             if reference > 0:
                 drop = (
@@ -478,7 +479,7 @@ def capital_needed(
 
 
 # ============================================================
-# ANALISI MERCATO 30 GIORNI
+# ANALISI MERCATO 200 GIORNI
 # ============================================================
 
 def mean_coin_return(closes, start_idx, end_idx):
@@ -1832,35 +1833,46 @@ def run():
         args,
     )
 
+    required_capital = max(args.capital, current_required)
+    funded_args = SimpleNamespace(**vars(args))
+    funded_args.capital = required_capital
+    funded_result = simulate(
+        times, closes, highs, BUY_USD, CURRENT_DIP_PERCENT,
+        CURRENT_TP_PERCENT, 1, funded_args,
+    )
+
     # --------------------------------------------------------
-    # B. ANALISI ULTIMI 30 GIORNI
+    # B. ANALISI COMPLESSIVA 200 GIORNI + MESE CORRENTE
     # --------------------------------------------------------
 
-    current_start = max(
-        0,
-        len(times) - ANALYSIS_CANDLES,
+    analysis_start = max(0, len(times) - ANALYSIS_CANDLES)
+    analysis_regime = market_regime(
+        times, closes, highs, lows,
+        analysis_start, len(times) - 1,
     )
+    analysis_levels = physiological_levels(
+        closes, highs, lows,
+        analysis_start, len(times) - 1, SELL_PERCENT,
+    )
+
+    current_month = datetime.fromtimestamp(
+        times[-1] / 1000, timezone.utc
+    ).strftime("%Y-%m")
+    current_start, current_end = month_indices(times, current_month)
+    if current_start is None:
+        current_start = analysis_start
+    if current_end is None:
+        current_end = len(times) - 1
 
     current_regime = market_regime(
-        times,
-        closes,
-        highs,
-        lows,
-        current_start,
-        len(times) - 1,
+        times, closes, highs, lows, current_start, current_end,
     )
-
     current_levels = physiological_levels(
-        closes,
-        highs,
-        lows,
-        current_start,
-        len(times) - 1,
-        SELL_PERCENT,
+        closes, highs, lows, current_start, current_end, SELL_PERCENT,
     )
 
     log(
-        f"REGIME 30G | "
+        f"REGIME 200G | "
         f"{current_regime['regime']} | "
         f"rendimento {current_regime['return_pct']:+.2f}% | "
         f"trend {current_regime['trend_pct']:+.2f}% | "
@@ -1868,11 +1880,11 @@ def run():
     )
 
     log(
-        f"30G FISIOLOGICO | "
-        f"DIP mode {current_levels['dip']['mode']}% "
-        f"freq {current_levels['dip']['mode_frequency']}% | "
-        f"TP mode {current_levels['tp']['mode']}% "
-        f"freq {current_levels['tp']['mode_frequency']}%"
+        f"200G FISIOLOGICO | "
+        f"DIP mode {analysis_levels['dip']['mode']}% "
+        f"freq {analysis_levels['dip']['mode_frequency']}% | "
+        f"TP mode {analysis_levels['tp']['mode']}% "
+        f"freq {analysis_levels['tp']['mode_frequency']}%"
     )
 
     # --------------------------------------------------------
@@ -2010,7 +2022,16 @@ def run():
     )
 
     print("\n" + "=" * 68)
-    print("ANALISI MERCATO 30 GIORNI | CANDELE 4H")
+    print("SIMULAZIONE CON CAPITALE NECESSARIO | PARAMETRI ATTUALI")
+    print("=" * 68)
+    print(f"Capitale attuale: ${args.capital:.2f}")
+    print(f"Buy saltati per fondi insufficienti: {current_result['missed_buys']}")
+    print(f"Capitale stimato per non saltare buy: ${required_capital:.2f}")
+    print(f"Capitale aggiuntivo necessario: ${max(0, required_capital - args.capital):.2f}")
+    print_report("CAPITALE NECESSARIO - BUY NON SALTATI", funded_result, funded_args, closes)
+
+    print("\n" + "=" * 68)
+    print("ANALISI MERCATO 200 GIORNI | CANDELE 4H")
     print("=" * 68)
 
     print(
@@ -2019,6 +2040,16 @@ def run():
         f"{current_regime['end']}"
     )
 
+    print(f"REGIME COMPLESSIVO 200G: {analysis_regime['regime']} | rendimento {analysis_regime['return_pct']:+.2f}% | trend {analysis_regime['trend_pct']:+.2f}%")
+    print(f"REGIME MESE CORRENTE ({current_month}): {current_regime['regime']} | rendimento {current_regime['return_pct']:+.2f}% | trend {current_regime['trend_pct']:+.2f}%")
+    print("\nREGIME E DIP/TP PER MESE (periodo disponibile):")
+    for month in months:
+        start, end = month_indices(times, month)
+        if start is None or end is None or end - start < 6:
+            continue
+        mr = market_regime(times, closes, highs, lows, start, end)
+        ml = physiological_levels(closes, highs, lows, start, end, SELL_PERCENT)
+        print(f"{month} | {mr['regime']:<8} | rendimento {mr['return_pct']:+6.2f}% | DIP {ml['dip']['mode']}% (n={ml['dip']['count']}) | TP {ml['tp']['mode']}% (n={ml['tp']['count']})")
     print(
         f"REGIME: {current_regime['regime']}"
     )
@@ -2044,22 +2075,18 @@ def run():
     )
 
     print(
-        f"DIP fisiologico: "
-        f"mode {current_levels['dip']['mode']}% | "
-        f"mediana {current_levels['dip']['median']}% | "
-        f"P25/P75 "
-        f"{current_levels['dip']['p25']}/"
-        f"{current_levels['dip']['p75']}%"
+        f"DIP PIU FREQUENTE 200G: mode {analysis_levels['dip']['mode']}% "
+        f"(frequenza {analysis_levels['dip']['mode_frequency']}%, n={analysis_levels['dip']['count']}) | "
+        f"mediana {analysis_levels['dip']['median']}% | "
+        f"P25/P75 {analysis_levels['dip']['p25']}/{analysis_levels['dip']['p75']}%"
     )
-
     print(
-        f"TP fisiologico: "
-        f"mode {current_levels['tp']['mode']}% | "
-        f"mediana {current_levels['tp']['median']}% | "
-        f"P25/P75 "
-        f"{current_levels['tp']['p25']}/"
-        f"{current_levels['tp']['p75']}%"
+        f"TP PIU FREQUENTE 200G: mode {analysis_levels['tp']['mode']}% "
+        f"(frequenza {analysis_levels['tp']['mode_frequency']}%, n={analysis_levels['tp']['count']}) | "
+        f"mediana {analysis_levels['tp']['median']}% | "
+        f"P25/P75 {analysis_levels['tp']['p25']}/{analysis_levels['tp']['p75']}%"
     )
+    print(f"TARGET FISIOLOGICI DEL MESE: DIP {current_levels['dip']['mode']}% / TP {current_levels['tp']['mode']}%")
 
     print("\n" + "=" * 68)
     print(
@@ -2122,11 +2149,13 @@ def run():
     )
 
     tg = (
-        f"30G: {current_regime['regime']} "
+        f"200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
+        f"MESE {current_month}: {current_regime['regime']} "
         f"{current_regime['return_pct']:+.1f}%\n"
-        f"DIP fisiologico: "
-        f"{current_levels['dip']['mode']}% | "
-        f"TP: {current_levels['tp']['mode']}%\n\n"
+        f"DIP/TP mese: {current_levels['dip']['mode']}% / "
+        f"{current_levels['tp']['mode']}%\n"
+        f"DIP/TP 200g: {analysis_levels['dip']['mode']}% / "
+        f"{analysis_levels['tp']['mode']}%\n\n"
         f"Storico {current_regime['regime']}: "
         f"{hist_stats['months']} mesi\n"
         f"DIP: "
@@ -2139,6 +2168,9 @@ def run():
         f"Suggerito: "
         f"DIP {suggested['dip']:.1f}% / "
         f"TP {suggested['tp']:.1f}%\n\n"
+        f"Buy saltati: {current_result['missed_buys']}\n"
+        f"Capitale per zero buy saltati: ${required_capital:.0f}\n"
+        f"Rendimento simulato capitale necessario: {funded_result['ret']:+.1f}%\n\n"
         f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
         f"attuale {cap_curr_txt} | "
         f"suggerito {cap_suggested_txt}\n\n"
