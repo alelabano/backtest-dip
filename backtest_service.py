@@ -2040,7 +2040,7 @@ def run():
         f"{current_regime['end']}"
     )
 
-    print(f"REGIME COMPLESSIVO 200G: {analysis_regime['regime']} | rendimento {analysis_regime['return_pct']:+.2f}% | trend {analysis_regime['trend_pct']:+.2f}%")
+    print(f"MERCATO 200G (non rendimento bot): {analysis_regime['regime']} | variazione mercato {analysis_regime['return_pct']:+.2f}% | trend {analysis_regime['trend_pct']:+.2f}%")
     print(f"REGIME MESE CORRENTE ({current_month}): {current_regime['regime']} | rendimento {current_regime['return_pct']:+.2f}% | trend {current_regime['trend_pct']:+.2f}%")
     print("\nREGIME E DIP/TP PER MESE (periodo disponibile):")
     for month in months:
@@ -2149,7 +2149,7 @@ def run():
     )
 
     tg = (
-        f"200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
+        f"MERCATO 200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
         f"MESE {current_month}: {current_regime['regime']} "
         f"{current_regime['return_pct']:+.1f}%\n"
         f"DIP/TP mese: {current_levels['dip']['mode']}% / "
@@ -2168,9 +2168,12 @@ def run():
         f"Suggerito: "
         f"DIP {suggested['dip']:.1f}% / "
         f"TP {suggested['tp']:.1f}%\n\n"
+        f"BOT capitale attuale ${args.capital:.2f}: "
+        f"{current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f})\n"
         f"Buy saltati: {current_result['missed_buys']}\n"
-        f"Capitale per zero buy saltati: ${required_capital:.0f}\n"
-        f"Rendimento simulato capitale necessario: {funded_result['ret']:+.1f}%\n\n"
+        f"Capitale per zero buy saltati: ${required_capital:.2f}\n"
+        f"BOT con capitale necessario: {funded_result['ret']:+.1f}% "
+        f"(${funded_result['final'] - required_capital:+.2f})\n\n"
         f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
         f"attuale {cap_curr_txt} | "
         f"suggerito {cap_suggested_txt}\n\n"
