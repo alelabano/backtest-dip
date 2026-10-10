@@ -7,10 +7,12 @@ Logica:
    BULLISH / BEARISH / NEUTRAL.
 3) Misura DIP e TP fisiologici osservati nel periodo.
 4) Confronta il mese corrente con i mesi storici dello stesso regime.
-5) Suggerisce DIP/TP in funzione del regime e della statistica storica.
-6) Conserva uno storico JSON per mese/regime.
-7) Mantiene il calcolo del capitale necessario e del target mensile.
-8) Invia un riepilogo compatto a Telegram.
+5) Cerca target standard sulle oscillazioni fisiologiche del training.
+6) Verifica i target sul 30% finale, non usato nella selezione; se non superano
+   il test rispetto ai parametri attuali, non propone alcun cambio.
+7) Conserva uno storico JSON per mese/regime.
+8) Mantiene il calcolo del capitale necessario e del target mensile.
+9) Invia un riepilogo compatto a Telegram.
 
 NOTA:
 - HISTORY_FILE deve stare su un Railway Volume se si vuole persistenza
@@ -1121,35 +1123,165 @@ def suggested_targets(current_regime, current_levels, historical):
 
 
 def optimize_targets(times, closes, highs, buy_usd, interval, args,
-                     start_idx=0, end_idx=None):
-    """Cerca i DIP/TP con miglior valore finale usando lo stesso capitale iniziale.
+                     start_idx=0, end_idx=None, physiological=None,
+                     train_ratio=0.70):
+    """Seleziona target sul periodo di addestramento e li verifica su dati successivi.
 
-    Il regime di mercato non viene usato per alzare artificialmente il DIP:
-    i target sono scelti in base al risultato effettivo della simulazione.
+    Il 70% iniziale è usato per scegliere i target; il 30% finale resta escluso
+    dalla selezione ed è usato una sola volta come test fuori campione.
+    La scelta privilegia rendimento mediano, continuità dei risultati e drawdown,
+    non il profitto massimo ottenuto sull'intero storico.
     """
     if end_idx is None:
         end_idx = len(times) - 1
-    if start_idx > 0 or end_idx < len(times) - 1:
-        times2 = times[start_idx:end_idx + 1]
-        closes2 = {c: v[start_idx:end_idx + 1] for c, v in closes.items()}
-        highs2 = {c: v[start_idx:end_idx + 1] for c, v in highs.items()}
-    else:
-        times2, closes2, highs2 = times, closes, highs
+    if not 0.60 <= train_ratio <= 0.80:
+        raise ValueError("train_ratio deve essere tra 0.60 e 0.80")
+
+    times_all = times[start_idx:end_idx + 1]
+    closes_all = {c: v[start_idx:end_idx + 1] for c, v in closes.items()}
+    highs_all = {c: v[start_idx:end_idx + 1] for c, v in highs.items()}
+    n = len(times_all)
+    split = int(n * train_ratio)
+    if split < 180 or n - split < 60:
+        raise ValueError("Dati insufficienti per selezione e test fuori campione")
+
+    train_times = times_all[:split]
+    train_closes = {c: v[:split] for c, v in closes_all.items()}
+    train_highs = {c: v[:split] for c, v in highs_all.items()}
+    test_times = times_all[split:]
+    test_closes = {c: v[split:] for c, v in closes_all.items()}
+    test_highs = {c: v[split:] for c, v in highs_all.items()}
+
+    physiological = physiological or {}
+
+    def bounds(level, default_low, default_high, hard_low, hard_high):
+        p25 = level.get("p25") if level else None
+        p75 = level.get("p75") if level else None
+        if p25 is None or p75 is None:
+            lo, hi = default_low, default_high
+        else:
+            # Margine contenuto attorno alla fascia centrale degli swing osservati.
+            lo = max(hard_low, math.floor((p25 - 0.5) * 2) / 2)
+            hi = min(hard_high, math.ceil((p75 + 0.5) * 2) / 2)
+        if hi < lo:
+            lo, hi = default_low, default_high
+        return lo, hi
+
+    dip_lo, dip_hi = bounds(physiological.get("dip"), 1.5, 4.0, 1.0, 6.0)
+    tp_lo, tp_hi = bounds(physiological.get("tp"), 2.0, 6.0, 1.5, 8.0)
+    dips = [round(i * 0.5, 1) for i in range(round(dip_lo * 2), round(dip_hi * 2) + 1)]
+    tps = [round(i * 0.5, 1) for i in range(round(tp_lo * 2), round(tp_hi * 2) + 1)]
+
+    # Selezione solo nel training: tre finestre cronologiche interne.
+    folds = []
+    for k in range(3):
+        a_idx = k * len(train_times) // 3
+        b_idx = (k + 1) * len(train_times) // 3
+        if b_idx - a_idx >= 60:
+            folds.append((a_idx, b_idx))
+    if len(folds) < 3:
+        raise ValueError("Dati insufficienti per tre finestre di training")
 
     candidates = []
-    for dip_i in range(2, 17):  # 1.0%-8.0%, passi 0.5%
-        dip = dip_i * 0.5
-        for tp_i in range(3, 21):  # 1.5%-10.0%, passi 0.5%
-            tp = tp_i * 0.5
-            result = simulate(times2, closes2, highs2, buy_usd, dip, tp,
-                              interval, args)
-            candidates.append((result["final"], -result["missed_buys"],
-                               -result["dd"], dip, tp, result))
+    phys_dip = physiological.get("dip", {}).get("median")
+    phys_tp = physiological.get("tp", {}).get("median")
+    for dip in dips:
+        for tp in tps:
+            fold_results = []
+            for a_idx, b_idx in folds:
+                sub_times = train_times[a_idx:b_idx]
+                sub_closes = {c: v[a_idx:b_idx] for c, v in train_closes.items()}
+                sub_highs = {c: v[a_idx:b_idx] for c, v in train_highs.items()}
+                fold_results.append(simulate(
+                    sub_times, sub_closes, sub_highs, buy_usd,
+                    dip, tp, interval, args,
+                ))
+            returns = [r["ret"] for r in fold_results]
+            median_ret = statistics.median(returns)
+            positive_fraction = sum(x > 0 for x in returns) / len(returns)
+            worst_dd = max(r["dd"] for r in fold_results)
+            avg_missed = statistics.mean(r["missed_buys"] for r in fold_results)
+            total_sells = sum(r["sells"] for r in fold_results)
+            # Penalizza oscillazioni del risultato, drawdown e target lontani dai livelli centrali.
+            spread = max(returns) - min(returns)
+            distance = (abs(dip - phys_dip) if phys_dip is not None else 0.0) + \
+                       (abs(tp - phys_tp) if phys_tp is not None else 0.0)
+            score = median_ret - 0.15 * worst_dd - 0.10 * spread
+            candidates.append({
+                "score": score,
+                "median_ret": median_ret,
+                "positive_fraction": positive_fraction,
+                "worst_dd": worst_dd,
+                "avg_missed": avg_missed,
+                "distance": distance,
+                "dip": dip,
+                "tp": tp,
+                "sells": total_sells,
+            })
 
-    best = max(candidates, key=lambda x: (x[0], x[1], x[2]))
-    return {"dip": best[3], "tp": best[4], "result": best[5],
-            "profit": best[5]["final"] - args.capital,
-            "ret": best[5]["ret"], "missed_buys": best[5]["missed_buys"]}
+    # Prima rendimento robusto, poi continuità, drawdown, ordini saltati e vicinanza
+    # alle oscillazioni centrali. Esclude coppie che non hanno generato vendite.
+    viable = [c for c in candidates if c["sells"] >= 3]
+    if not viable:
+        viable = candidates
+    best = max(viable, key=lambda c: (
+        c["score"], c["positive_fraction"], -c["worst_dd"],
+        -c["avg_missed"], -c["distance"],
+    ))
+
+    candidate_test = simulate(
+        test_times, test_closes, test_highs, buy_usd,
+        best["dip"], best["tp"], interval, args,
+    )
+    baseline_test = simulate(
+        test_times, test_closes, test_highs, buy_usd,
+        CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args,
+    )
+    # Il target è convalidato solo se il test escluso dalla selezione è positivo,
+    # supera il baseline di almeno 0,5 punti percentuali, ha vendite reali e
+    # non peggiora il drawdown di oltre 2 punti.
+    improvement = candidate_test["ret"] - baseline_test["ret"]
+    validated = (
+        candidate_test["ret"] > 0
+        and improvement >= 0.5
+        and candidate_test["sells"] >= 3
+        and candidate_test["dd"] <= baseline_test["dd"] + 2.0
+    )
+
+    full_candidate = simulate(
+        times_all, closes_all, highs_all, buy_usd,
+        best["dip"], best["tp"], interval, args,
+    )
+    full_baseline = simulate(
+        times_all, closes_all, highs_all, buy_usd,
+        CURRENT_DIP_PERCENT, CURRENT_TP_PERCENT, interval, args,
+    )
+
+    train_end_ts = train_times[-1]
+    test_start_ts = test_times[0]
+    date_fmt = lambda ts: datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%Y-%m-%d")
+    return {
+        "dip": best["dip"],
+        "tp": best["tp"],
+        "validated": validated,
+        "result": full_candidate,
+        "baseline_full": full_baseline,
+        "profit": full_candidate["final"] - args.capital,
+        "ret": full_candidate["ret"],
+        "missed_buys": full_candidate["missed_buys"],
+        "train_median_ret": best["median_ret"],
+        "train_positive_fraction": best["positive_fraction"],
+        "train_worst_dd": best["worst_dd"],
+        "test_result": candidate_test,
+        "baseline_test": baseline_test,
+        "test_improvement": improvement,
+        "test_start": date_fmt(test_start_ts),
+        "train_end": date_fmt(train_end_ts),
+        "candidate_count": len(candidates),
+        "dip_range": (dip_lo, dip_hi),
+        "tp_range": (tp_lo, tp_hi),
+        "train_windows": len(folds),
+    }
 
 
 # ============================================================
@@ -1504,7 +1636,7 @@ def print_report(
         f"BUY ${r['buy']:.0f} | "
         f"DIP {r['dip']:.1f}% | "
         f"TP {r['tp']:.1f}% | "
-        f"ciclo {r['int']}h"
+        f"frequenza simulazione ogni {r['int']} candela/e da {CANDLE_INTERVAL}"
     )
 
     print(
@@ -1769,6 +1901,7 @@ def run():
 
     log("=" * 68)
     log("AVVIO NUOVO CICLO")
+    log(f"ASSET CONFIGURATI: {', '.join(COINS)} | intervallo candele {CANDLE_INTERVAL} | giorni {BACKTEST_DAYS}")
     log("=" * 68)
 
     from hyperliquid.info import Info
@@ -1955,47 +2088,50 @@ def run():
     # D. TARGET CONSIGLIATI
     # --------------------------------------------------------
 
-    # I target operativi sono scelti dal rendimento del bot, non dedotti
-    # meccanicamente dal regime bullish/bearish o dalla sola ampiezza degli swing.
+    # I livelli fisiologici usati per costruire i candidati sono calcolati
+    # esclusivamente sul 70% iniziale, mai sul periodo di test.
+    split_idx = analysis_start + int((len(times) - analysis_start) * 0.70)
+    train_levels = physiological_levels(
+        closes, highs, lows, analysis_start, max(analysis_start, split_idx - 1), SELL_PERCENT,
+    )
     optimized = optimize_targets(
         times, closes, highs, BUY_USD, 1, args,
-        analysis_start, len(times) - 1,
+        analysis_start, len(times) - 1, train_levels,
     )
-    suggested = {"dip": optimized["dip"], "tp": optimized["tp"]}
+    # Se i target non superano il test indipendente, non cambiare i parametri correnti.
+    suggested = (
+        {"dip": optimized["dip"], "tp": optimized["tp"]}
+        if optimized["validated"]
+        else {"dip": CURRENT_DIP_PERCENT, "tp": CURRENT_TP_PERCENT}
+    )
     log(
-        f"OTTIMIZZAZIONE TARGET 200G | DIP {suggested['dip']:.1f}% / "
-        f"TP {suggested['tp']:.1f}% | profitto "
-        f"${optimized['profit']:+.2f} ({optimized['ret']:+.1f}%) | "
-        f"buy saltati {optimized['missed_buys']}"
+        f"TARGET CANDIDATO (training) | DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}% | "
+        f"fasce fisiologiche DIP {optimized['dip_range'][0]:.1f}-{optimized['dip_range'][1]:.1f}% "
+        f"TP {optimized['tp_range'][0]:.1f}-{optimized['tp_range'][1]:.1f}% | "
+        f"training mediano {optimized['train_median_ret']:+.2f}% "
+        f"finestre positive {optimized['train_positive_fraction']:.0%}"
+    )
+    log(
+        f"TEST FUORI CAMPIONE {optimized['test_start']} -> {datetime.fromtimestamp(times[-1] / 1000, timezone.utc).strftime('%Y-%m-%d')} | "
+        f"candidato {optimized['test_result']['ret']:+.2f}% "
+        f"(${optimized['test_result']['final'] - args.capital:+.2f}), "
+        f"SELL {optimized['test_result']['sells']}, DD {optimized['test_result']['dd']:.2f}% | "
+        f"attuale {optimized['baseline_test']['ret']:+.2f}% "
+        f"(${optimized['baseline_test']['final'] - args.capital:+.2f}), "
+        f"SELL {optimized['baseline_test']['sells']}, DD {optimized['baseline_test']['dd']:.2f}% | "
+        f"validato={'SI' if optimized['validated'] else 'NO'}"
     )
 
     target_changed = (
-        abs(
-            suggested["dip"]
-            - CURRENT_DIP_PERCENT
-        ) >= 0.5
-        or abs(
-            suggested["tp"]
-            - CURRENT_TP_PERCENT
-        ) >= 0.5
+        abs(suggested["dip"] - CURRENT_DIP_PERCENT) >= 0.5
+        or abs(suggested["tp"] - CURRENT_TP_PERCENT) >= 0.5
     )
-
-    if hist_stats["months"] < 2:
-        suggestion = (
-            "RACCOLTA DATI: storico insufficiente"
-        )
+    if not optimized["validated"]:
+        suggestion = "NESSUN CAMBIO: target candidato non supera il test indipendente"
     elif not target_changed:
-        suggestion = (
-            f"MANTENERE DIP "
-            f"{CURRENT_DIP_PERCENT:.1f}% / "
-            f"TP {CURRENT_TP_PERCENT:.1f}%"
-        )
+        suggestion = f"MANTENERE DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}%"
     else:
-        suggestion = (
-            f"CAMBIO SUGGERITO -> DIP "
-            f"{suggested['dip']:.1f}% / "
-            f"TP {suggested['tp']:.1f}%"
-        )
+        suggestion = f"CAMBIO VALIDATO -> DIP {suggested['dip']:.1f}% / TP {suggested['tp']:.1f}%"
 
     # --------------------------------------------------------
     # E. CAPITALE CON TARGET SUGGERITI
@@ -2148,7 +2284,7 @@ def run():
         )
 
     print(
-        f"\nTARGET SUGGERITI: "
+        f"\nTARGET ADOTTABILI (solo se validati): "
         f"DIP {suggested['dip']:.1f}% / "
         f"TP {suggested['tp']:.1f}%"
     )
@@ -2164,17 +2300,24 @@ def run():
     cap_curr_txt = (
         f"${cap_curr:.0f}"
         if reach_curr and cap_curr
-        else "N/D"
+        else "N/D (storico insufficiente o target non raggiunto)"
     )
 
     cap_suggested_txt = (
         f"${cap_suggested:.0f}"
         if reach_suggested and cap_suggested
-        else "N/D"
+        else "N/D (storico insufficiente o target non raggiunto)"
     )
 
+    asset_moves_text = "; ".join(
+        f"{coin} {(closes[coin][-1] / closes[coin][analysis_start] - 1) * 100:+.1f}%"
+        for coin in closes
+        if closes[coin][analysis_start] > 0
+    )
     tg = (
-        f"MERCATO 200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
+        f"ASSET: {', '.join(closes.keys())}\n"
+        f"VARIAZIONE PREZZI 200G: {asset_moves_text}\n"
+        f"MEDIA SEMPLICE RENDIMENTI ASSET 200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
         f"MESE {current_month}: {current_regime['regime']} "
         f"{current_regime['return_pct']:+.1f}%\n"
         f"DIP/TP mese: {current_levels['dip']['mode']}% / "
@@ -2190,10 +2333,15 @@ def run():
         f"Attuale: "
         f"DIP {CURRENT_DIP_PERCENT:.1f}% / "
         f"TP {CURRENT_TP_PERCENT:.1f}%\n"
-        f"Target migliori backtest 200g: "
-        f"DIP {suggested['dip']:.1f}% / TP {suggested['tp']:.1f}%\n"
-        f"Esito target: {optimized['ret']:+.1f}% "
-        f"(${optimized['profit']:+.2f}), buy saltati {optimized['missed_buys']}\n\n"
+        f"TARGET CANDIDATO: DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}%\n"
+        f"TEST INDIPENDENTE ({optimized['test_start']} -> {datetime.fromtimestamp(times[-1] / 1000, timezone.utc).strftime('%Y-%m-%d')}):\n"
+        f"candidato {optimized['test_result']['ret']:+.1f}% (${optimized['test_result']['final'] - args.capital:+.2f}), "
+        f"SELL {optimized['test_result']['sells']}, DD {optimized['test_result']['dd']:.1f}%\n"
+        f"attuale {optimized['baseline_test']['ret']:+.1f}% (${optimized['baseline_test']['final'] - args.capital:+.2f}), "
+        f"SELL {optimized['baseline_test']['sells']}, DD {optimized['baseline_test']['dd']:.1f}%\n"
+        f"Esito test: {'VALIDATO' if optimized['validated'] else 'NON VALIDATO'}\n"
+        f"Backtest 200g candidato: {optimized['ret']:+.1f}% (${optimized['profit']:+.2f}); "
+        f"buy saltati {optimized['missed_buys']}\n\n"
         f"BOT capitale attuale ${args.capital:.2f}: "
         f"{current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f})\n"
         f"Buy saltati: {current_result['missed_buys']}\n"
@@ -2203,7 +2351,8 @@ def run():
         f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
         f"attuale {cap_curr_txt} | "
         f"suggerito {cap_suggested_txt}\n\n"
-        f"Target da backtest: DIP {suggested['dip']:.1f}% / TP {suggested['tp']:.1f}%\n"
+        f"Oscillazioni standard osservate: DIP {optimized['dip_range'][0]:.1f}-{optimized['dip_range'][1]:.1f}% / "
+        f"TP {optimized['tp_range'][0]:.1f}-{optimized['tp_range'][1]:.1f}%\n"
         f"{suggestion}"
     )
 
