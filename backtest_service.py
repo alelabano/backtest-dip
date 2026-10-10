@@ -956,10 +956,12 @@ def analyze_historical_months(
             month,
         )
 
+        # Con candele 4H, 18 intervalli equivalgono a 3 giorni.
+        # Evita di scartare mesi parziali con dati sufficienti per le statistiche.
         if (
             start is None
             or end is None
-            or end - start < 72
+            or end - start < 18
         ):
             continue
 
