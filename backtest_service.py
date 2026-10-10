@@ -1096,81 +1096,60 @@ def regime_statistics(
 # TARGET CONSIGLIATO
 # ============================================================
 
-def suggested_targets(
-    current_regime,
-    current_levels,
-    historical,
-):
-    """
-    Target operativo basato su eventi 4H.
-
-    Combina mediana e moda per evitare che un singolo bin domini
-    la decisione. Lo storico dello stesso regime pesa più del
-    solo mese corrente.
-    """
+def suggested_targets(current_regime, current_levels, historical):
+    """Placeholder statistic targets; operational suggestions come from backtest optimization."""
     def central(level):
         if not level:
             return None
-
-        median = level.get("median")
-        mode = level.get("mode")
-
-        if median is None and mode is None:
-            return None
+        median, mode = level.get("median"), level.get("mode")
         if median is None:
-            return float(mode)
+            return float(mode) if mode is not None else None
         if mode is None:
             return float(median)
-
         return 0.60 * float(median) + 0.40 * float(mode)
 
-    current_dip = central(current_levels["dip"])
-    current_tp = central(current_levels["tp"])
-
-    hist_dip = historical.get("dip_median")
-    hist_tp = historical.get("tp_median")
-    hist_dip_mode = historical.get("dip_mode")
-    hist_tp_mode = historical.get("tp_mode")
-
-    if hist_dip is not None and hist_dip_mode is not None:
-        hist_dip = 0.60 * hist_dip + 0.40 * hist_dip_mode
-    elif hist_dip is None:
-        hist_dip = hist_dip_mode
-
-    if hist_tp is not None and hist_tp_mode is not None:
-        hist_tp = 0.60 * hist_tp + 0.40 * hist_tp_mode
-    elif hist_tp is None:
-        hist_tp = hist_tp_mode
-
-    if hist_dip is not None and current_dip is not None:
-        dip = 0.65 * hist_dip + 0.35 * current_dip
-    else:
-        dip = hist_dip if hist_dip is not None else current_dip
-
-    if hist_tp is not None and current_tp is not None:
-        tp = 0.65 * hist_tp + 0.35 * current_tp
-    else:
-        tp = hist_tp if hist_tp is not None else current_tp
-
+    dip = central(current_levels.get("dip", {}))
+    tp = central(current_levels.get("tp", {}))
     if dip is None:
         dip = 2.0
     if tp is None:
-        tp = 3.0
-
-    if current_regime == "BULLISH":
-        dip *= 0.95
-        tp *= 1.05
-    elif current_regime == "BEARISH":
-        dip *= 1.05
-        tp *= 0.90
-
-    dip = round(max(1.0, min(dip, 12.0)) / BIN_SIZE) * BIN_SIZE
-    tp = round(max(1.0, min(tp, 15.0)) / BIN_SIZE) * BIN_SIZE
-
+        tp = 4.0
     return {
-        "dip": round(dip, 1),
-        "tp": round(tp, 1),
+        "dip": round(max(1.0, min(dip, 12.0)) / BIN_SIZE) * BIN_SIZE,
+        "tp": round(max(1.0, min(tp, 15.0)) / BIN_SIZE) * BIN_SIZE,
     }
+
+
+def optimize_targets(times, closes, highs, buy_usd, interval, args,
+                     start_idx=0, end_idx=None):
+    """Cerca i DIP/TP con miglior valore finale usando lo stesso capitale iniziale.
+
+    Il regime di mercato non viene usato per alzare artificialmente il DIP:
+    i target sono scelti in base al risultato effettivo della simulazione.
+    """
+    if end_idx is None:
+        end_idx = len(times) - 1
+    if start_idx > 0 or end_idx < len(times) - 1:
+        times2 = times[start_idx:end_idx + 1]
+        closes2 = {c: v[start_idx:end_idx + 1] for c, v in closes.items()}
+        highs2 = {c: v[start_idx:end_idx + 1] for c, v in highs.items()}
+    else:
+        times2, closes2, highs2 = times, closes, highs
+
+    candidates = []
+    for dip_i in range(2, 17):  # 1.0%-8.0%, passi 0.5%
+        dip = dip_i * 0.5
+        for tp_i in range(3, 21):  # 1.5%-10.0%, passi 0.5%
+            tp = tp_i * 0.5
+            result = simulate(times2, closes2, highs2, buy_usd, dip, tp,
+                              interval, args)
+            candidates.append((result["final"], -result["missed_buys"],
+                               -result["dd"], dip, tp, result))
+
+    best = max(candidates, key=lambda x: (x[0], x[1], x[2]))
+    return {"dip": best[3], "tp": best[4], "result": best[5],
+            "profit": best[5]["final"] - args.capital,
+            "ret": best[5]["ret"], "missed_buys": best[5]["missed_buys"]}
 
 
 # ============================================================
@@ -1412,18 +1391,39 @@ def get_real_capital(
     coins_value = 0.0
     extra_value = 0.0
 
-    for balance in user_state.get(
-        "balances",
-        [],
-    ):
-        name = balance.get("coin")
-        total = float(
-            balance.get("total", 0)
-            or 0
+    spot_balances = user_state.get("balances", [])
+    if not isinstance(spot_balances, list):
+        raise ValueError(
+            "Risposta spot_user_state inattesa: 'balances' non è una lista"
         )
 
-        if name == "USDC":
-            usdc_balance = total
+    # Diagnostica esplicita: permette di vedere quale saldo restituisce
+    # davvero l'API e quanto è libero (total - hold).
+    log(
+        "CAPITALE REALE | indirizzo letto: "
+        f"{ACCOUNT_ADDRESS[:6]}...{ACCOUNT_ADDRESS[-4:]}"
+        if ACCOUNT_ADDRESS and len(ACCOUNT_ADDRESS) > 12
+        else f"CAPITALE REALE | indirizzo letto: {ACCOUNT_ADDRESS or 'NON CONFIGURATO'}"
+    )
+    for balance in spot_balances:
+        coin_label = str(balance.get("coin", ""))
+        try:
+            total_debug = float(balance.get("total", 0) or 0)
+            hold_debug = float(balance.get("hold", 0) or 0)
+        except (TypeError, ValueError):
+            total_debug, hold_debug = 0.0, 0.0
+        log(
+            f"SALDO SPOT API | coin={coin_label!r} "
+            f"total=${total_debug:.8f} hold=${hold_debug:.8f} "
+            f"libero=${max(0.0, total_debug-hold_debug):.8f}"
+        )
+
+    for balance in spot_balances:
+        name = str(balance.get("coin", "")).strip().upper()
+        total = float(balance.get("total", 0) or 0)
+
+        if name in ("USDC", "USDC(0)"):
+            usdc_balance += total
             continue
 
         handled = False
@@ -1463,6 +1463,17 @@ def get_real_capital(
         + coins_value
         + extra_value
     )
+
+    if not spot_balances:
+        log(
+            "ERRORE CAPITALE | l'API non ha restituito saldi Spot; "
+            "verificare ACCOUNT_ADDRESS e il wallet configurato"
+        )
+    elif usdc_balance == 0:
+        log(
+            "ATTENZIONE CAPITALE | nessuna riga USDC riconosciuta nella "
+            "risposta Spot; consultare le righe SALDO SPOT API sopra"
+        )
 
     log(
         f"CAPITALE REALE | USDC "
@@ -1587,7 +1598,7 @@ COINS = [
     c.strip().upper()
     for c in os.getenv(
         "COINS",
-        "HYPE,ZEC,ETH,SOL",
+        "BTC",
     ).split(",")
     if c.strip()
 ]
@@ -1944,10 +1955,18 @@ def run():
     # D. TARGET CONSIGLIATI
     # --------------------------------------------------------
 
-    suggested = suggested_targets(
-        current_regime["regime"],
-        current_levels,
-        hist_stats,
+    # I target operativi sono scelti dal rendimento del bot, non dedotti
+    # meccanicamente dal regime bullish/bearish o dalla sola ampiezza degli swing.
+    optimized = optimize_targets(
+        times, closes, highs, BUY_USD, 1, args,
+        analysis_start, len(times) - 1,
+    )
+    suggested = {"dip": optimized["dip"], "tp": optimized["tp"]}
+    log(
+        f"OTTIMIZZAZIONE TARGET 200G | DIP {suggested['dip']:.1f}% / "
+        f"TP {suggested['tp']:.1f}% | profitto "
+        f"${optimized['profit']:+.2f} ({optimized['ret']:+.1f}%) | "
+        f"buy saltati {optimized['missed_buys']}"
     )
 
     target_changed = (
@@ -2042,7 +2061,11 @@ def run():
         f"{current_regime['end']}"
     )
 
-    print(f"MERCATO 200G (non rendimento bot): {analysis_regime['regime']} | variazione mercato {analysis_regime['return_pct']:+.2f}% | trend {analysis_regime['trend_pct']:+.2f}%")
+    for coin in closes:
+        p_start = closes[coin][analysis_start]
+        p_end = closes[coin][-1]
+        move = (p_end / p_start - 1) * 100 if p_start else 0.0
+        print(f"MERCATO 200G {coin}: {analysis_regime['regime']} | prezzo iniziale {p_start:.6g} -> finale {p_end:.6g} | variazione reale {move:+.2f}%")
     print(f"REGIME MESE CORRENTE ({current_month}): {current_regime['regime']} | rendimento {current_regime['return_pct']:+.2f}% | trend {current_regime['trend_pct']:+.2f}%")
     print("\nREGIME E DIP/TP PER MESE (periodo disponibile):")
     for month in months:
@@ -2167,9 +2190,10 @@ def run():
         f"Attuale: "
         f"DIP {CURRENT_DIP_PERCENT:.1f}% / "
         f"TP {CURRENT_TP_PERCENT:.1f}%\n"
-        f"Suggerito: "
-        f"DIP {suggested['dip']:.1f}% / "
-        f"TP {suggested['tp']:.1f}%\n\n"
+        f"Target migliori backtest 200g: "
+        f"DIP {suggested['dip']:.1f}% / TP {suggested['tp']:.1f}%\n"
+        f"Esito target: {optimized['ret']:+.1f}% "
+        f"(${optimized['profit']:+.2f}), buy saltati {optimized['missed_buys']}\n\n"
         f"BOT capitale attuale ${args.capital:.2f}: "
         f"{current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f})\n"
         f"Buy saltati: {current_result['missed_buys']}\n"
@@ -2179,6 +2203,7 @@ def run():
         f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
         f"attuale {cap_curr_txt} | "
         f"suggerito {cap_suggested_txt}\n\n"
+        f"Target da backtest: DIP {suggested['dip']:.1f}% / TP {suggested['tp']:.1f}%\n"
         f"{suggestion}"
     )
 
