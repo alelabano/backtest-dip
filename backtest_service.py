@@ -977,12 +977,31 @@ def run():
         f"{coin} {(closes[coin][-1] / closes[coin][analysis_start] - 1) * 100:+.1f}%"
         for coin in closes if closes[coin][analysis_start] > 0
     )
-        tg = (
-            f"{suggestion}\n"
-            f"Attuale DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}% → {current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f}), buy saltati {current_result['missed_buys']}\n"
-            f"Candidato DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}% → test {optimized['test_result']['ret']:+.1f}% vs attuale {optimized['baseline_test']['ret']:+.1f}%\n"
-            f"Capitale ${args.capital:.2f}, per zero buy saltati ${required_capital:.2f}"
-        )
+    tg = (
+        f"ASSET: {', '.join(closes.keys())}\n"
+        f"VARIAZIONE PREZZI 200G: {asset_moves_text}\n"
+        f"MEDIA SEMPLICE RENDIMENTI ASSET 200G: {analysis_regime['regime']} {analysis_regime['return_pct']:+.1f}%\n"
+        f"MESE {current_month}: {current_regime['regime']} {current_regime['return_pct']:+.1f}%\n"
+        f"DIP/TP mese: {current_levels['dip']['mode']}% / {current_levels['tp']['mode']}%\n"
+        f"DIP/TP 200g: {analysis_levels['dip']['mode']}% / {analysis_levels['tp']['mode']}%\n\n"
+        f"Storico {current_regime['regime']}: {hist_stats['months']} mesi\n"
+        f"DIP: {hist_stats['dip_mode'] if hist_stats['dip_mode'] is not None else 'N/D'}% | TP: {hist_stats['tp_mode'] if hist_stats['tp_mode'] is not None else 'N/D'}%\n\n"
+        f"Attuale: DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}%\n"
+        f"TARGET CANDIDATO: DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}%\n"
+        f"TEST INDIPENDENTE ({optimized['test_start']} -> {datetime.fromtimestamp(times[-1] / 1000, timezone.utc).strftime('%Y-%m-%d')}):\n"
+        f"candidato {optimized['test_result']['ret']:+.1f}% (${optimized['test_result']['final'] - args.capital:+.2f}), SELL {optimized['test_result']['sells']}, DD {optimized['test_result']['dd']:.1f}%\n"
+        f"attuale {optimized['baseline_test']['ret']:+.1f}% (${optimized['baseline_test']['final'] - args.capital:+.2f}), SELL {optimized['baseline_test']['sells']}, DD {optimized['baseline_test']['dd']:.1f}%\n"
+        f"Esito test: {'VALIDATO' if optimized['validated'] else 'NON VALIDATO'}\n"
+        f"Backtest 200g candidato: {optimized['ret']:+.1f}% (${optimized['profit']:+.2f}); buy saltati {optimized['missed_buys']}\n\n"
+        f"BOT capitale attuale ${args.capital:.2f}: {current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f})\n"
+        f"Buy saltati: {current_result['missed_buys']}\n"
+        f"Capitale per zero buy saltati: ${required_capital:.2f}\n"
+        f"BOT con capitale necessario: {funded_result['ret']:+.1f}% (${funded_result['final'] - required_capital:+.2f})\n\n"
+        f"Capitale target ${TARGET_MONTHLY_PROFIT:.0f}/mese:\n"
+        f"attuale {cap_curr_txt} | suggerito {cap_suggested_txt}\n\n"
+        f"Oscillazioni standard osservate: DIP {optimized['dip_range'][0]:.1f}-{optimized['dip_range'][1]:.1f}% / TP {optimized['tp_range'][0]:.1f}-{optimized['tp_range'][1]:.1f}%\n"
+        f"{suggestion}"
+    )
 
     now_ts = time.time()
 
