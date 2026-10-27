@@ -978,11 +978,11 @@ def run():
         for coin in closes if closes[coin][analysis_start] > 0
     )
         tg = (
-        f"{suggestion}\n"
-        f"Attuale DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}% → {current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f}), buy saltati {current_result['missed_buys']}\n"
-        f"Candidato DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}% → test {optimized['test_result']['ret']:+.1f}% vs attuale {optimized['baseline_test']['ret']:+.1f}%\n"
-        f"Capitale ${args.capital:.2f}, per zero buy saltati ${required_capital:.2f}"
-    )
+            f"{suggestion}\n"
+            f"Attuale DIP {CURRENT_DIP_PERCENT:.1f}% / TP {CURRENT_TP_PERCENT:.1f}% → {current_result['ret']:+.1f}% (${current_result['final'] - args.capital:+.2f}), buy saltati {current_result['missed_buys']}\n"
+            f"Candidato DIP {optimized['dip']:.1f}% / TP {optimized['tp']:.1f}% → test {optimized['test_result']['ret']:+.1f}% vs attuale {optimized['baseline_test']['ret']:+.1f}%\n"
+            f"Capitale ${args.capital:.2f}, per zero buy saltati ${required_capital:.2f}"
+        )
 
     now_ts = time.time()
 
