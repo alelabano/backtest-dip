@@ -1,6 +1,6 @@
-""""
+"""
 BACKTEST / MARKET REGIME ANALYZER - Hyperliquid Spot
-""""
+"""
 
 import json
 import math
